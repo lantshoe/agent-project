@@ -1,0 +1,11 @@
+[1] What Is a Man Without a Moustache?
+What Is a Man Without a Moustache? (Croatian: Što je muškarac bez brkova?) is a 2005 Croatian romantic comedy-drama film. Hrvoje Hribar directed the film and wrote the screenplay as an adaptation of Ante Tomić's 2000 novel of the same name.Starring Leon Lučev and Zrinka Cvitešić and set against a background of a country still recovering from the Croatian War of Independence, the film tells the story of a young widow who falls in love with a local priest and a difficult choice that the priest faces when being forced to choose between the woman and his church. It won the audience award at the Pula Film Festival as the favourite film while Zrinka Cvitešić won two festival awards for her performance in the film.
+Source: https://en.wikipedia.org/wiki/What_Is_a_Man_Without_a_Moustache?
+
+[2] Model Context Protocol - Wikipedia
+Relationship between MCP client and server The Model Context Protocol (MCP) is an open standard and open-source framework introduced by Anthropic in November 2024 to standardize the way artificial intelligence (AI) systems like large language models (LLMs) integrate and share data with external tools, systems, and data sources. [1] MCP provides a universal interface for reading files ...
+Source: https://en.wikipedia.org/wiki/Model_Context_Protocol
+
+[3] What is the Model Context Protocol (MCP)?
+MCP (Model Context Protocol) is an open-source standard for connecting AI applications to external systems. Using MCP, AI applications like Claude or ChatGPT can connect to data sources (e.g. local files, databases), tools (e.g. search engines, calculators) and workflows (e.g. specialized prompts)—enabling them to access key information and ...
+Source: https://modelcontextprotocol.io/docs/getting-started/intro
