@@ -2,27 +2,12 @@ import os
 from pathlib import Path
 from langchain_core.tools import tool
 from dotenv import load_dotenv
+from agents.utils.sandbox import get_safe_path, SANDBOX_DIR
 
 load_dotenv()
-SANDBOX_DIR = Path(os.getenv("AGENT_SANDBOX_DIR", "./agent_workspace")).resolve()
 MAX_FILE_SIZE_MB = int(os.getenv("AGENT_MAX_FILE_SIZE_MB", "5"))
 ALLOWED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".xlsx", ".py", ".yaml", ".yml"}
 
-def _get_safe_path(file_path: str) -> Path:
-    """
-    Resolves the path and ensures it stays inside the sandbox.
-    Raises ValueError if the path tries to escape the sandbox.
-    """
-    SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
-    full_path = (SANDBOX_DIR / file_path).resolve()
-
-    if not str(full_path).startswith(str(SANDBOX_DIR)):
-        raise ValueError(f"Access denied: '{file_path}' is outside the workspace.")
-
-    if full_path.suffix.lower() not in ALLOWED_EXTENSIONS:
-        raise ValueError(f"File type '{full_path.suffix}' is not allowed.")
-
-    return full_path
 
 
 @tool
@@ -31,7 +16,7 @@ def read_file(full_path: str) -> str:
     read and return the contents of a file
     """
     try:
-        safe_path = _get_safe_path(full_path)
+        safe_path = get_safe_path(full_path,ALLOWED_EXTENSIONS)
         if not safe_path.exists():
             return f"Error: File '{full_path}' not found in workspace."
 
@@ -54,7 +39,7 @@ def write_file(full_path: str, content: str) -> str:
     Example input filepath: "data/report.txt", content: "Hello World"
     """
     try:
-        safe_path = _get_safe_path(full_path)
+        safe_path = get_safe_path(full_path,ALLOWED_EXTENSIONS)
         size_mb = len(content.encode("utf-8")) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
             return f"Error: Content is too large ({size_mb:.1f}MB). Max allowed is {MAX_FILE_SIZE_MB}MB."
@@ -80,7 +65,7 @@ def list_files(subdirectory: str = ".") -> str:
     Example input: "." or "reports/"
     """
     try:
-        safe_path = _get_safe_path(subdirectory) if subdirectory != "." else SANDBOX_DIR
+        safe_path = get_safe_path(subdirectory,ALLOWED_EXTENSIONS) if subdirectory != "." else SANDBOX_DIR
         SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
         if not safe_path.exists():

@@ -1,0 +1,13 @@
+class ToolNames:
+    CREATE_WORKBOOK = "create_workbook"
+    LIST_SHEETS = "list_sheets"
+    READ_SHEET = "read_sheet"
+    WRITE_SHEET = "write_sheet"
+    SUM_COLUMN = "sum_column"
+    AVERAGE_COLUMN = "average_column"
+    MIN_MAX_COLUMN = "min_max_column"
+    COUNT_COLUMN = "count_column"
+    FILTER_ROWS = "filter_rows"
+    SORT_SHEET = "sort_sheet"
+    FIND_DUPLICATES = "find_duplicates"
+    RENAME_SHEET = "rename_sheet"

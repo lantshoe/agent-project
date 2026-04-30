@@ -7,6 +7,25 @@ from agents.core.logger import get_logger
 
 logger = get_logger("tool_node")
 
+
+def unwrap_mcp_result(raw_output) -> str:
+    """
+    MCP tools return results wrapped in a list of content blocks.
+    This unwraps them to a clean string for the LLM.
+
+    Input:  [{'type': 'text', 'text': '{"status": "success", ...}', 'id': '...'}]
+    Output: {"status": "success", ...}
+    """
+    if isinstance(raw_output, list):
+        texts = []
+        for block in raw_output:
+            if isinstance(block, dict) and "text" in block:
+                texts.append(block["text"])
+            elif hasattr(block, "text"):
+                texts.append(block.text)
+        return "\n".join(texts) if texts else str(raw_output)
+    return str(raw_output)
+
 def make_tool_node(tools: list[BaseTool]):
     """
     ReAct strict mode tool node:
@@ -27,7 +46,7 @@ def make_tool_node(tools: list[BaseTool]):
         tool_id = tool_call["id"]
         logger.debug(f"-> Action: {tool_name} | args: {tool_args} | ID: {tool_id}")
         tool = tool_map.get(tool_name)
-
+        step_record = {}
         if not tool:
             result = {
                 "status": "error",
@@ -36,9 +55,13 @@ def make_tool_node(tools: list[BaseTool]):
         else:
             try:
                 output = await tool.ainvoke(tool_args)
-                result = {
-                    "status": "success",
-                    "output": str(output)
+                clean_output = unwrap_mcp_result(output)
+                result = json.loads(clean_output)
+                step_record = {
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "status": result.get("status", None),
+                    # "summary": _summarize_result(tool_name, result)
                 }
             except Exception as e:
                 result = {
@@ -47,9 +70,12 @@ def make_tool_node(tools: list[BaseTool]):
                 }
         logger.debug(f"<- Observation result: {result}")
 
-        return {"messages": [ToolMessage(
-            content=json.dumps(result),
-            tool_call_id=tool_id
-        )]}
+        return {
+            "messages": [ToolMessage(
+                content=json.dumps(result),
+                tool_call_id=tool_id
+            )],
+            "completed_steps": [step_record]
+        }
 
     return tool_node

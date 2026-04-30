@@ -1,3 +1,5 @@
+import json
+
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -27,6 +29,7 @@ class AgentState(TypedDict):
     add_message is a LangGraph reducer - it appends instead of overwriting.
     """
     messages: Annotated[list, add_messages]
+    completed_steps: Annotated[list, lambda old, new: old + new]
 
 SANDBOX_DIR = get_sandbox_dir()
 # System Prompt
@@ -41,13 +44,50 @@ RULES:
 - Wait for tool result before continuing
 
 FILESYSTEM RULES:
-All filesystem operations MUST use paths inside the sandbox directory. 
 Sandbox root: agent_workspace
+All file paths must be relative and inside agent_workspace/.
+
 
 IMPORTANT:
 Tool execution is handled externally.
 You only decide WHICH tool to call and WITH WHAT arguments.
 """
+
+STEP_PROMPT="""
+Current progress (tools already executed this session):
+{steps_text}
+
+Use this to decide what to do next. Do NOT repeat successful steps.
+"""
+
+
+def clean_message_history(messages: list) -> list:
+    """
+    Removes stale tool_calls from AIMessages that had multiple tool calls planned.
+    This prevents the LLM from re-following its old batch plan.
+    Also removes orphaned ToolMessages whose tool_call_id no longer matches.
+    """
+    cleaned = []
+    valid_tool_call_ids = set()
+
+    for msg in messages:
+        if hasattr(msg, "tool_calls"):
+            if len(msg.tool_calls) > 1:
+                # Strip extra tool calls — keep content but clear the batch plan
+                msg = msg.model_copy(update={"tool_calls": [], "additional_kwargs": {}})
+            else:
+                for tc in msg.tool_calls:
+                    valid_tool_call_ids.add(tc["id"])
+
+        # Skip orphaned ToolMessages
+        if hasattr(msg, "tool_call_id"):
+            if msg.tool_call_id not in valid_tool_call_ids:
+                continue
+
+        cleaned.append(msg)
+
+    return cleaned
+
 
 
 # routing logic
@@ -66,8 +106,24 @@ def build_agent(tools):
     def call_llm(state: AgentState) -> AgentState:
         llm = get_llm(skill=Skill.REASONING)
         llm_with_tools = llm.bind_tools(tools=tools)
-        message = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        llm_response = llm_with_tools.invoke(message)
+        completed = state.get("completed_steps", [])
+        if completed:
+            steps_text = "\n".join([
+                f"  {'✅' if s and s.get('status') == 'success' else '❌'} {s.get('tool')}"
+                for s in completed
+            ])
+            progress_message = SystemMessage(content=STEP_PROMPT.format(steps_text=steps_text))
+        else:
+            progress_message = None
+
+        clean_history = clean_message_history(state["messages"])
+        messages = [SystemMessage(content=SYSTEM_PROMPT)]
+        if progress_message:
+            messages.append(progress_message)
+        messages += clean_history
+
+        logger.debug(f"message-------------: {messages}")
+        llm_response = llm_with_tools.invoke(messages)
         return {"messages": [llm_response]}
 
 
@@ -106,5 +162,15 @@ def run_agent(user_input: str) -> str:
 
 if __name__ == "__main__":
     # response = run_agent('Write a file called mcp_test.txt with content: MCP is working! Then read the content back.')
-    response = run_agent('Search online "what is a MCP",  and then write the result to MCP.txt file')
+    # response = run_agent('Search online "what is a MCP",  and then write the result to MCP.txt file')
+    # print(response)
+    response = run_agent('''
+    Create an Excel file called sales.xlsx with this data:
+    | product  | revenue | units |
+    | Widget A | 5000    | 100   |
+    | Widget B | 3000    | 60    |
+    | Widget C | 8000    | 160   |
+    | Widget D | 1500    | 30    |
+    Then calculate the average revenue, find the max revenue, and filter products where revenue > 4000.
+    ''')
     print(response)

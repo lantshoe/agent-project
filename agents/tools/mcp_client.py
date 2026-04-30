@@ -1,9 +1,7 @@
-import asyncio
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
+import sys
 load_dotenv()
 
 
@@ -19,7 +17,9 @@ def get_mcp_config() -> dict:
     Central config for all MCP servers.
     To add a new MCP server, just add an entry here.
     """
-
+    base_dir = Path(__file__).resolve().parent
+    project_root = base_dir.parent.parent
+    excel_path = project_root / "mcp_servers" / "excel_server.py"
     return {
         "filesystem": {
             "command": "npx",
@@ -28,5 +28,10 @@ def get_mcp_config() -> dict:
                 SANDBOX_DIR
             ],
             "transport": "stdio"
+        },
+        "excel": {
+            "command": sys.executable,
+            "args": [str(excel_path)],
+            "transport": "stdio",
         }
     }
