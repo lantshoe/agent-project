@@ -249,7 +249,7 @@ def average_column(filepath: str, sheet_name: str, column: str):
 
 @tool(
     name=ToolNames.MIN_MAX_COLUMN,
-    description="Get the minimum and maximum values of a numeric column.",
+    description="Get the minimum or maximum values of a numeric column.",
     input_schema={
         "type": "object",
         "properties": {
@@ -309,13 +309,13 @@ def count_column(filepath: str, sheet_name: str, column: str):
         "required": ["filepath", "column", "operator", "value"]
     }
 )
-def filter_rows(filepath: str, sheet_name: str, column: str, operation: str, value: str):
+def filter_rows(filepath: str, sheet_name: str, column: str, operator: str, value: str):
     safe_path = get_safe_path(filepath)
     wb = openpyxl.load_workbook(safe_path)
     ws = wb[sheet_name] if sheet_name else wb.active
     rows = sheet_to_json(ws)
     col = column
-    op = operation
+    op = operator
     val = value
 
     def matches(row):

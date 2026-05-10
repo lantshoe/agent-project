@@ -1,26 +1,24 @@
-import json
-
-from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+import asyncio
 from typing import Annotated
-from typing_extensions import TypedDict
-from langgraph.prebuilt import ToolNode
 
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+
+from agents.core.executor import execute_next_step
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
+from agents.core.planner import create_plan
 from agents.core.skill_enum import Skill
-from langgraph.graph.message import add_messages
-import asyncio
-
 from agents.core.tool_node import make_tool_node
 from agents.tools.calculator import calculator
 from agents.tools.mcp_client import get_mcp_config, get_sandbox_dir
 from agents.tools.search import web_search
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
 
 logger = get_logger("agent")
+
 
 # Agent State
 class AgentState(TypedDict):
@@ -30,6 +28,9 @@ class AgentState(TypedDict):
     """
     messages: Annotated[list, add_messages]
     completed_steps: Annotated[list, lambda old, new: old + new]
+    plan: list
+    current_step: int
+
 
 SANDBOX_DIR = get_sandbox_dir()
 # System Prompt
@@ -51,13 +52,6 @@ All file paths must be relative and inside agent_workspace/.
 IMPORTANT:
 Tool execution is handled externally.
 You only decide WHICH tool to call and WITH WHAT arguments.
-"""
-
-STEP_PROMPT="""
-Current progress (tools already executed this session):
-{steps_text}
-
-Use this to decide what to do next. Do NOT repeat successful steps.
 """
 
 
@@ -89,7 +83,6 @@ def clean_message_history(messages: list) -> list:
     return cleaned
 
 
-
 # routing logic
 def should_use_tool(state: AgentState) -> str:
     last_message = state["messages"][-1]
@@ -102,30 +95,54 @@ def should_use_tool(state: AgentState) -> str:
     logger.debug("Thought → Final Answer")
     return END
 
+
 def build_agent(tools):
     def call_llm(state: AgentState) -> AgentState:
-        llm = get_llm(skill=Skill.REASONING)
-        llm_with_tools = llm.bind_tools(tools=tools)
+        plan = state.get("plan", [])
         completed = state.get("completed_steps", [])
-        if completed:
-            steps_text = "\n".join([
-                f"  {'✅' if s and s.get('status') == 'success' else '❌'} {s.get('tool')}"
-                for s in completed
-            ])
-            progress_message = SystemMessage(content=STEP_PROMPT.format(steps_text=steps_text))
+        completed_tool_names = {s["tool"] for s in completed if s and s["status"] == "success"}
+        print(f"completed tools: {completed}")
+        if plan:
+            remaining = [
+                s for s in plan
+                if s["tool"] not in completed_tool_names
+            ]
+
+            if not remaining:
+                # All steps done , ask LLM for final answer only
+                llm = get_llm(skill=Skill.REASONING)
+                results_summary = "\n".join(completed_tool_names)
+                response = llm.invoke([
+                                          SystemMessage(
+                                              content="Summarize the results of the completed tasks clearly."),
+                                          SystemMessage(content=f"Results:\n{results_summary}"),
+                                      ] + state["messages"][:1])
+                return {"messages": [response]}
+
+            next_step = remaining[0]
+            next_reason = next_step["reason"]
+            next_tool = next_step['tool']
+            logger.debug(f"Executor → next step: {next_tool} ({next_reason})")
+            clean_history = clean_message_history(state["messages"])
+            response = execute_next_step(
+                next_tool=next_tool,
+                next_reason=next_reason,
+                tools=tools,
+                messages=clean_history,
+            )
+
+
         else:
-            progress_message = None
-
-        clean_history = clean_message_history(state["messages"])
-        messages = [SystemMessage(content=SYSTEM_PROMPT)]
-        if progress_message:
-            messages.append(progress_message)
-        messages += clean_history
-
-        logger.debug(f"message-------------: {messages}")
-        llm_response = llm_with_tools.invoke(messages)
-        return {"messages": [llm_response]}
-
+            logger.debug("No plan — free ReAct mode")
+            llm = get_llm(skill=Skill.REASONING)
+            llm_with_tools = llm.bind_tools(tools)
+            clean_history = clean_message_history(state["messages"])
+            response = llm_with_tools.invoke(
+                [SystemMessage(content=SYSTEM_PROMPT)] + clean_history
+            )
+            if hasattr(response, "tool_calls") and len(response.tool_calls) > 1:
+                response.tool_calls = [response.tool_calls[0]]
+        return {"messages": [response]}
 
     graph = StateGraph(AgentState)
 
@@ -134,9 +151,10 @@ def build_agent(tools):
 
     graph.set_entry_point("llm")
     graph.add_conditional_edges("llm", should_use_tool)
-    graph.add_edge("tools","llm")
+    graph.add_edge("tools", "llm")
 
     return graph.compile()
+
 
 async def run_agent_async(user_input: str) -> str:
     """
@@ -145,14 +163,30 @@ async def run_agent_async(user_input: str) -> str:
     """
     client = MultiServerMCPClient(get_mcp_config())
     mcp_tools = await client.get_tools()
+
     all_tools = [calculator, web_search] + mcp_tools
+    logger.debug("Planning...")
+    plan = create_plan(user_input, all_tools)
+    if plan:
+        plan_text = "\n".join([
+            f"  Step {s['step']}: {s['tool']} — {s['reason']}"
+            for s in plan
+        ])
+        logger.debug(f"Plan: {plan_text}")
+    else:
+        logger.debug("No plan generated — executor will decide")
+
     agent = build_agent(all_tools)
 
     result = await agent.ainvoke({
-        "messages": [HumanMessage(content=user_input)]
+        "messages": [HumanMessage(content=user_input)],
+        "completed_steps": [],
+        "plan": plan,
+        "current_step": 0,
     })
 
     return result["messages"][-1].content
+
 
 # ── 5. Sync wrapper ────────────────────────────────────────────────────────────
 def run_agent(user_input: str) -> str:
