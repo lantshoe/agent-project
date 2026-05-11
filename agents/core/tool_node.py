@@ -1,8 +1,9 @@
 import json
+
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
-from langgraph.prebuilt import ToolNode
 
+from agents.core.arg_validator import validate_and_fix_args
 from agents.core.logger import get_logger
 
 logger = get_logger("tool_node")
@@ -53,21 +54,35 @@ def make_tool_node(tools: list[BaseTool]):
                 "error": f"Tool '{tool_name}' not found."
             }
         else:
-            try:
-                output = await tool.ainvoke(tool_args)
-                clean_output = unwrap_mcp_result(output)
-                result = json.loads(clean_output)
-                step_record = {
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "status": result.get("status", None),
-                    # "summary": _summarize_result(tool_name, result)
-                }
-            except Exception as e:
+            fixed_args, warnings = validate_and_fix_args(tool, tool_args)
+            if warnings:
+                logger.debug(f"Arg validation warnings: {warnings}")
+
+            missing = [w for w in warnings if w.startswith("Missing required")]
+            if missing:
                 result = {
                     "status": "error",
-                    "error": str(e)
+                    "error": f"Missing required arguments: {missing}",
+                    "hint": "Check the tool schema and provide all required fields."
                 }
+            else:
+                try:
+                    output = await tool.ainvoke(fixed_args)
+                    clean_output = unwrap_mcp_result(output)
+                    result = json.loads(clean_output)
+                    step_record = {
+                        "tool": tool_name,
+                        "args": fixed_args,
+                        "status": result.get("status", None),
+                        # "summary": _summarize_result(tool_name, result)
+                    }
+                except Exception as e:
+                    result = {
+                        "status": "error",
+                        "error": str(e),
+                        "tool": tool_name,
+                        "args": fixed_args
+                    }
         logger.debug(f"<- Observation result: {result}")
 
         return {

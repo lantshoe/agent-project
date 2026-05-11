@@ -87,8 +87,8 @@ def clean_message_history(messages: list) -> list:
 def should_use_tool(state: AgentState) -> str:
     last_message = state["messages"][-1]
     tool_calls = getattr(last_message, "tool_calls", [])
-    print(f"last_message: {last_message}")
-    print("tool_calls: ", tool_calls)
+    logger.debug(f"last_message: {last_message}")
+    logger.debug(f"tool_calls: {tool_calls}")
     if tool_calls:
         logger.debug(f"Thought → Action: {[t['name'] for t in tool_calls]}")
         return "tools"
@@ -101,7 +101,7 @@ def build_agent(tools):
         plan = state.get("plan", [])
         completed = state.get("completed_steps", [])
         completed_tool_names = {s["tool"] for s in completed if s and s["status"] == "success"}
-        print(f"completed tools: {completed}")
+        logger.debug(f"completed tools: {completed}")
         if plan:
             remaining = [
                 s for s in plan
