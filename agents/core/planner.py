@@ -23,6 +23,8 @@ RULES:
 Respond ONLY with a valid JSON array, no other text.
 """
 USER_PROMPT = """
+{memory_section}
+
 TOOL LIST (choose EXACT match only):
 {tool_descriptions}
 
@@ -31,6 +33,14 @@ Do not invent or modify tool names.
 
 User request: {user_input}
 Produce a JSON plan array.
+"""
+
+
+MEMORY_PROMPT = """
+Relevant memory from past sessions:
+{memory_context}
+
+Use this to avoid past mistakes and reuse good plans.
 """
 
 RESPONSE_PROMPT = """
@@ -51,13 +61,13 @@ Regenerate the ENTIRE plan as valid JSON.
 
 Respond ONLY JSON.
 """
-def create_plan(user_input: str, available_tools: list) -> list[dict]:
+def create_plan(user_input: str, available_tools: list, memory_context = "") -> list[dict]:
     """
     Planner role — takes user input and produces a structured execution plan.
     Called ONCE before the executor starts.
     """
     max_retry = 3
-    plans = generate_plan(user_input, available_tools)
+    plans = generate_plan(user_input, available_tools,memory_context)
     invalid_tools = get_invalidate_tools(available_tools, plans)
     for _ in range(max_retry):
         if len(invalid_tools) > 0:
@@ -68,16 +78,17 @@ def create_plan(user_input: str, available_tools: list) -> list[dict]:
     return plans
 
 
-def generate_plan(user_input: str, available_tools: list) -> list[dict]:
+def generate_plan(user_input: str, available_tools: list, memory_context: str) -> list[dict]:
     tool_descriptions = "\n".join([
         f"-{t.name}: {t.description[:150]}"
         for t in available_tools
     ])
 
     llm = get_llm(skill=Skill.REASONING)
+    memory_section = MEMORY_PROMPT.format(memory_context = memory_context) if memory_context else ""
     response = llm.invoke([
         SystemMessage(content=PLANNER_PROMPT),
-        HumanMessage(content=USER_PROMPT.format(tool_descriptions=tool_descriptions, user_input=user_input)),
+        HumanMessage(content=USER_PROMPT.format(tool_descriptions=tool_descriptions, user_input=user_input, memory_section=memory_section)),
     ])
     return retrieve_plan(response)
 

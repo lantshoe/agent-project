@@ -1,38 +1,26 @@
 import asyncio
 from typing import Annotated
-
+from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
-
 from agents.core.executor import execute_next_step
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
 from agents.core.planner import create_plan
 from agents.core.skill_enum import Skill
 from agents.core.tool_node import make_tool_node
+from agents.memory.evaluator import evaluate_execution_quality
+from agents.memory.long_term import LongTermMemory
 from agents.tools.calculator import calculator
 from agents.tools.mcp_client import get_mcp_config, get_sandbox_dir
 from agents.tools.search import web_search
 
 logger = get_logger("agent")
-
-
-# Agent State
-class AgentState(TypedDict):
-    """
-    Everything the agents remembers during one run.
-    add_message is a LangGraph reducer - it appends instead of overwriting.
-    """
-    messages: Annotated[list, add_messages]
-    completed_steps: Annotated[list, lambda old, new: old + new]
-    plan: list
-    current_step: int
-
-
 SANDBOX_DIR = get_sandbox_dir()
+
 # System Prompt
 SYSTEM_PROMPT = """
 You are an autonomous agent that uses tools.
@@ -54,6 +42,16 @@ Tool execution is handled externally.
 You only decide WHICH tool to call and WITH WHAT arguments.
 """
 
+# Agent State
+class AgentState(TypedDict):
+    """
+    Everything the agents remembers during one run.
+    add_message is a LangGraph reducer - it appends instead of overwriting.
+    """
+    messages: Annotated[list, add_messages]
+    completed_steps: Annotated[list, lambda old, new: old + new]
+    plan: list
+    current_step: int
 
 def clean_message_history(messages: list) -> list:
     """
@@ -156,17 +154,22 @@ def build_agent(tools):
     return graph.compile()
 
 
-async def run_agent_async(user_input: str) -> str:
+async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
     """
     Main async entry point.
     MCP client stays alive for the full duration of the agent run.
     """
     client = MultiServerMCPClient(get_mcp_config())
     mcp_tools = await client.get_tools()
-
     all_tools = [calculator, web_search] + mcp_tools
+
+    memory = LongTermMemory(user_id=user_id)
+    memory_context = memory.format_for_llm(user_input)
+    if memory_context:
+        logger.debug(f"Memory context: {memory_context}")
+
     logger.debug("Planning...")
-    plan = create_plan(user_input, all_tools)
+    plan = create_plan(user_input, all_tools, memory_context = memory_context)
     if plan:
         plan_text = "\n".join([
             f"  Step {s['step']}: {s['tool']} — {s['reason']}"
@@ -183,6 +186,30 @@ async def run_agent_async(user_input: str) -> str:
         "completed_steps": [],
         "plan": plan,
         "current_step": 0,
+    })
+
+    final_answer = result["messages"][-1].content
+    completed_steps = result.get("completed_steps",[])
+
+    evaluation = evaluate_execution_quality(
+        user_input=user_input,
+        plan = plan,
+        completed_steps=completed_steps,
+        final_answer=final_answer,
+    )
+
+    memory.store_episode(
+        user_input=user_input,
+        completed_steps=completed_steps,
+        final_answer=final_answer,
+        evaluation=evaluation,
+    )
+
+    memory.update_profile({
+        "last_task": user_input[:100],
+        "tools_used": list({s.get("tool") for s in completed_steps}),
+        "task_quality": evaluation.get("quality"),
+        "session_date": datetime.now().isoformat()
     })
 
     return result["messages"][-1].content
