@@ -2,6 +2,7 @@ import json
 from langchain_core.messages import HumanMessage, SystemMessage
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
+from agents.core.models import PlanStep
 from agents.core.skill_enum import Skill
 
 logger = get_logger("planner")
@@ -43,7 +44,7 @@ Relevant memory from past sessions:
 Use this to avoid past mistakes and reuse good plans.
 """
 
-RESPONSE_PROMPT = """
+RETRY_PROMPT = """
 Your previous plan was invalid.
 
 Original user request:
@@ -56,29 +57,34 @@ Invalid tools used:
 {invalid_tools}
 
 You MUST ONLY use exact tool names from the allowed list.
-
 Regenerate the ENTIRE plan as valid JSON.
-
 Respond ONLY JSON.
 """
-def create_plan(user_input: str, available_tools: list, memory_context = "") -> list[dict]:
+def create_plan(user_input: str, available_tools: list, memory_context = "") -> list[PlanStep]:
     """
     Planner role — takes user input and produces a structured execution plan.
     Called ONCE before the executor starts.
     """
-    max_retry = 3
-    plans = generate_plan(user_input, available_tools,memory_context)
-    invalid_tools = get_invalidate_tools(available_tools, plans)
-    for _ in range(max_retry):
-        if len(invalid_tools) > 0:
-            logger.warning(f"Invalidating tools: {invalid_tools}")
-            plans = retry_generate_plan(user_input, available_tools, invalid_tools)
-            invalid_tools = get_invalidate_tools(available_tools,plans)
+    max_retries = 3
+    plans = _generate_plan(user_input, available_tools,memory_context)
+    invalid_tools = _get_invalidate_tools(available_tools, plans)
+    for _ in range(max_retries):
+        if not invalid_tools:
+            break
+        logger.warning(f"Invalidating tools: {invalid_tools}")
+        plans = _retry_generate_plan(user_input, available_tools, invalid_tools)
+        invalid_tools = _get_invalidate_tools(available_tools,plans)
+
+    if invalid_tools:
+        logger.error(f"Plan still contains invalid tools after {max_retries} retries: {invalid_tools}")
+        allowed = {t.name for t in available_tools}
+        plans = [s for s in plans if s.tool in allowed]
+
     logger.debug(f"Plan: {plans}")
     return plans
 
 
-def generate_plan(user_input: str, available_tools: list, memory_context: str) -> list[dict]:
+def _generate_plan(user_input: str, available_tools: list, memory_context: str) -> list[PlanStep]:
     tool_descriptions = "\n".join([
         f"-{t.name}: {t.description[:150]}"
         for t in available_tools
@@ -90,44 +96,41 @@ def generate_plan(user_input: str, available_tools: list, memory_context: str) -
         SystemMessage(content=PLANNER_PROMPT),
         HumanMessage(content=USER_PROMPT.format(tool_descriptions=tool_descriptions, user_input=user_input, memory_section=memory_section)),
     ])
-    return retrieve_plan(response)
+    return _retrieve_plan(response.content)
 
 
-def retrieve_plan(response) -> list[dict]:
+
+def _retrieve_plan(content) -> list[PlanStep]:
     try:
-        content = response.content.strip()
-        # clean markdown format
-        # sometime LLM return markdown format info
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        plan = json.loads(content.strip())
-        logger.debug(f"Plan created: {json.dumps(plan, indent=2)}")
-        return plan
+        text = content.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        raw_steps = json.loads(text.strip())
+        steps = [PlanStep(**s) for s in raw_steps]
+        logger.debug(f"Parsed plan: {json.dumps([s.model_dump() for s in steps], indent=2)}")
+        return steps
     except Exception as e:
-        logger.error(f"Planner failed to parse response: {e}")
+        logger.error(f"Failed to parse plan: {e}")
         return []
 
 
 
-def get_invalidate_tools(available_tools: list, plan_tools: list[dict]) -> list:
+def _get_invalidate_tools(available_tools: list, plan: list[PlanStep]) -> list:
     allowed_tools = {t.name for t in available_tools}
-    invalid_tools = []
-    for step in plan_tools:
-        if step["tool"] not in allowed_tools:
-            invalid_tools.append(step["tool"])
-    return invalid_tools
+    return [s.tool for s in plan if s.tool not in allowed_tools]
 
-def retry_generate_plan(user_input: str, available_tools:list, invalid_tools:list) -> list[dict]:
+
+def _retry_generate_plan(user_input: str, available_tools:list, invalid_tools:list) -> list[PlanStep]:
     llm = get_llm(skill=Skill.REASONING)
     tool_descriptions = "\n".join([
         f"-{t.name}: {t.description[:150]}"
         for t in available_tools
     ])
-    retry_prompt = RESPONSE_PROMPT.format(user_input=user_input, invalid_tools=invalid_tools, available_tools=tool_descriptions)
+    retry_prompt = RETRY_PROMPT.format(user_input=user_input, invalid_tools=invalid_tools, available_tools=tool_descriptions)
     response = llm.invoke([
         SystemMessage(content=PLANNER_PROMPT),
         HumanMessage(content=retry_prompt)
     ])
-    return retrieve_plan(response)
+    return _retrieve_plan(response)

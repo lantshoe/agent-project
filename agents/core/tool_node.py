@@ -5,6 +5,7 @@ from langchain_core.tools import BaseTool
 
 from agents.core.arg_validator import validate_and_fix_args
 from agents.core.logger import get_logger
+from agents.core.models import ToolResult, StepRecord
 
 logger = get_logger("tool_node")
 
@@ -49,48 +50,45 @@ def make_tool_node(tools: list[BaseTool]):
         tool = tool_map.get(tool_name)
         step_record = {}
         if not tool:
-            result = {
-                "status": "error",
-                "error": f"Tool '{tool_name}' not found."
-            }
-        else:
-            fixed_args, warnings = validate_and_fix_args(tool, tool_args)
-            if warnings:
-                logger.debug(f"Arg validation warnings: {warnings}")
+            result = ToolResult(status = "error", error = f"Tool '{tool_name}' not found.")
+            step = StepRecord(tool=tool_name, args=tool_args, status = "error", error=result.error)
+            return _build_return(result, step, tool_id)
 
-            missing = [w for w in warnings if w.startswith("Missing required")]
-            if missing:
-                result = {
-                    "status": "error",
-                    "error": f"Missing required arguments: {missing}",
-                    "hint": "Check the tool schema and provide all required fields."
-                }
-            else:
-                try:
-                    output = await tool.ainvoke(fixed_args)
-                    clean_output = unwrap_mcp_result(output)
-                    result = json.loads(clean_output)
-                    step_record = {
-                        "tool": tool_name,
-                        "args": fixed_args,
-                        "status": result.get("status", None),
-                        # "summary": _summarize_result(tool_name, result)
-                    }
-                except Exception as e:
-                    result = {
-                        "status": "error",
-                        "error": str(e),
-                        "tool": tool_name,
-                        "args": fixed_args
-                    }
-        logger.debug(f"<- Observation result: {result}")
 
-        return {
-            "messages": [ToolMessage(
-                content=json.dumps(result),
-                tool_call_id=tool_id
-            )],
-            "completed_steps": [step_record]
-        }
+
+        fixed_args, warnings = validate_and_fix_args(tool, tool_args)
+        if warnings:
+            logger.debug(f"Arg validation warnings: {warnings}")
+
+        missing = [w for w in warnings if w.startswith("Missing required")]
+        if missing:
+            result = ToolResult(status = "error", error = f"Missing required arguments: {missing}")
+            step = StepRecord(tool=tool_name, args=tool_args, status = "error", error=result.error)
+            return _build_return(result, step, tool_id)
+
+
+        try:
+            output = await tool.ainvoke(fixed_args)
+            result = ToolResult.from_raw(output)
+            step = StepRecord(tool=tool_name, args=fixed_args, status =result.status, output = result.output,error=result.error)
+
+        except Exception as e:
+            result = ToolResult(status = "error", error =  str(e))
+            step = StepRecord(tool=tool_name, args=fixed_args, status = "error", error=str(e))
+
+        logger.debug(f"<- Observation result: {result.status} | {result.output} | {result.error}")
+
+        return _build_return(result, step, tool_id)
 
     return tool_node
+
+def _build_return(result, step, tool_id) -> dict:
+    return {
+        "messages": [
+            ToolMessage(
+                content=json.dumps({"status": result.status, "output": result.output, "error":result.error}),
+                tool_call_id = tool_id,
+            )
+        ],
+        "completed_steps":[step],
+    }

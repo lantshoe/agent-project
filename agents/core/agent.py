@@ -1,7 +1,7 @@
 import asyncio
 from typing import Annotated
 from datetime import datetime
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -9,6 +9,7 @@ from typing_extensions import TypedDict
 from agents.core.executor import execute_next_step
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
+from agents.core.models import PlanStep, StepRecord
 from agents.core.planner import create_plan
 from agents.core.skill_enum import Skill
 from agents.core.tool_node import make_tool_node
@@ -25,8 +26,6 @@ SANDBOX_DIR = get_sandbox_dir()
 SYSTEM_PROMPT = """
 You are an autonomous agent that uses tools.
 
-You operate in a tool-calling system.
-
 RULES:
 - Use tools when necessary
 - Only ONE tool call per step
@@ -42,6 +41,8 @@ Tool execution is handled externally.
 You only decide WHICH tool to call and WITH WHAT arguments.
 """
 
+def _merge_steps(old: list[StepRecord], new: list[StepRecord]) -> list[StepRecord]:
+    return old + new
 # Agent State
 class AgentState(TypedDict):
     """
@@ -49,35 +50,46 @@ class AgentState(TypedDict):
     add_message is a LangGraph reducer - it appends instead of overwriting.
     """
     messages: Annotated[list, add_messages]
-    completed_steps: Annotated[list, lambda old, new: old + new]
-    plan: list
+    completed_steps: Annotated[list[StepRecord], _merge_steps]
+    plan: list[PlanStep]
     current_step: int
 
 def clean_message_history(messages: list) -> list:
     """
-    Removes stale tool_calls from AIMessages that had multiple tool calls planned.
-    This prevents the LLM from re-following its old batch plan.
-    Also removes orphaned ToolMessages whose tool_call_id no longer matches.
+    An AIMessage with tool_calls but no matching ToolMessage creates a
+    malformed conversation that some LLMs reject. We strip both sides.
+
+    Repair the potentially damaged tool calling conversation history
+    to a single tool conversation that LLM can safely read
+
+    Fix inconsistency between execution log and message history
     """
-    cleaned = []
-    valid_tool_call_ids = set()
 
+    # collect all tools id that have been executed
+    # no matter successful or failed
+    # each tool execution will generate a Toolmessage
+    present_tool_call_ids: set[str] = set()
     for msg in messages:
-        if hasattr(msg, "tool_calls"):
-            if len(msg.tool_calls) > 1:
-                # Strip extra tool calls — keep content but clear the batch plan
-                msg = msg.model_copy(update={"tool_calls": [], "additional_kwargs": {}})
-            else:
-                for tc in msg.tool_calls:
-                    valid_tool_call_ids.add(tc["id"])
+        if isinstance(msg, ToolMessage):
+            present_tool_call_ids.add(msg.tool_call_id)
 
-        # Skip orphaned ToolMessages
-        if hasattr(msg, "tool_call_id"):
-            if msg.tool_call_id not in valid_tool_call_ids:
+    cleaned = []
+    for msg in messages:
+        # the tools AI planed to call
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            matched = [tc for tc in msg.tool_calls if tc["id"] in present_tool_call_ids]
+            if not matched:
                 continue
+            # when some tool calls dont have corresponding tool message
+            if len(matched) < len(msg.tool_calls):
+                msg = msg.model_copy(update={"tool_calls": matched[:1], "additional_kwargs": {}})
+            elif len(matched) > 1:
+                msg = msg.model_copy(update={"tool_calls": matched[:1], "additional_kwargs": {}})
 
+        if isinstance(msg, ToolMessage):
+            if msg.tool_call_id not in present_tool_call_ids:
+                continue
         cleaned.append(msg)
-
     return cleaned
 
 
@@ -96,35 +108,29 @@ def should_use_tool(state: AgentState) -> str:
 
 def build_agent(tools):
     def call_llm(state: AgentState) -> AgentState:
-        plan = state.get("plan", [])
-        completed = state.get("completed_steps", [])
-        completed_tool_names = {s["tool"] for s in completed if s and s["status"] == "success"}
+        plan: list[PlanStep] = state.get("plan", [])
+        completed: list[StepRecord] = state.get("completed_steps", [])
+        completed_tool_names = {s.tool for s in completed if s.succeeded}
         logger.debug(f"completed tools: {completed}")
         if plan:
             remaining = [
                 s for s in plan
-                if s["tool"] not in completed_tool_names
+                if s.tool not in completed_tool_names
             ]
 
             if not remaining:
                 # All steps done , ask LLM for final answer only
                 llm = get_llm(skill=Skill.REASONING)
-                results_summary = "\n".join(completed_tool_names)
-                response = llm.invoke([
-                                          SystemMessage(
-                                              content="Summarize the results of the completed tasks clearly."),
-                                          SystemMessage(content=f"Results:\n{results_summary}"),
-                                      ] + state["messages"][:1])
+                response = llm.invoke([SystemMessage(content="All tasks are complete. Summarize the results clearly.")]
+                                    + state["messages"])
                 return {"messages": [response]}
 
             next_step = remaining[0]
-            next_reason = next_step["reason"]
-            next_tool = next_step['tool']
-            logger.debug(f"Executor → next step: {next_tool} ({next_reason})")
+            logger.debug(f"Executor → next step: {next_step.tool} ({next_step.reason})")
             clean_history = clean_message_history(state["messages"])
             response = execute_next_step(
-                next_tool=next_tool,
-                next_reason=next_reason,
+                next_tool=next_step.tool,
+                next_reason=next_step.reason,
                 tools=tools,
                 messages=clean_history,
             )
@@ -143,10 +149,8 @@ def build_agent(tools):
         return {"messages": [response]}
 
     graph = StateGraph(AgentState)
-
     graph.add_node("llm", call_llm)
     graph.add_node("tools", make_tool_node(tools))
-
     graph.set_entry_point("llm")
     graph.add_conditional_edges("llm", should_use_tool)
     graph.add_edge("tools", "llm")
@@ -171,10 +175,7 @@ async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
     logger.debug("Planning...")
     plan = create_plan(user_input, all_tools, memory_context = memory_context)
     if plan:
-        plan_text = "\n".join([
-            f"  Step {s['step']}: {s['tool']} — {s['reason']}"
-            for s in plan
-        ])
+        plan_text = "\n".join([f"  Step {s.step}: {s.tool} — {s.reason}" for s in plan])
         logger.debug(f"Plan: {plan_text}")
     else:
         logger.debug("No plan generated — executor will decide")
@@ -191,34 +192,50 @@ async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
     final_answer = result["messages"][-1].content
     completed_steps = result.get("completed_steps",[])
 
+    steps_as_dicts = [s.model_dump() for s in completed_steps]
+    plan_as_dicts = [s.model_dump() for s in plan] if plan else []
+
     evaluation = evaluate_execution_quality(
         user_input=user_input,
-        plan = plan,
-        completed_steps=completed_steps,
+        plan = plan_as_dicts,
+        completed_steps=steps_as_dicts,
         final_answer=final_answer,
     )
 
     memory.store_episode(
         user_input=user_input,
-        completed_steps=completed_steps,
+        completed_steps=steps_as_dicts,
         final_answer=final_answer,
         evaluation=evaluation,
     )
 
     memory.update_profile({
         "last_task": user_input[:100],
-        "tools_used": list({s.get("tool") for s in completed_steps}),
+        "tools_used": list({s.tool for s in completed_steps}),
         "task_quality": evaluation.get("quality"),
         "session_date": datetime.now().isoformat()
     })
 
-    return result["messages"][-1].content
+    return final_answer
 
 
 # ── 5. Sync wrapper ────────────────────────────────────────────────────────────
-def run_agent(user_input: str) -> str:
-    """Sync wrapper for convenience."""
-    return asyncio.run(run_agent_async(user_input))
+def run_agent(user_input: str, user_id: str = "default") -> str:
+    """safe sync wrapper that works inside running event loops
+    (FastAPI, Jupyter) as well as plain scripts."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Already inside an event loop (FastAPI, Jupyter) — schedule as a task
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(asyncio.run, run_agent_async(user_input, user_id))
+            return future.result()
+    else:
+        return asyncio.run(run_agent_async(user_input, user_id))
 
 
 if __name__ == "__main__":
