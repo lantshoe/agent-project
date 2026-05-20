@@ -133,4 +133,4 @@ def _retry_generate_plan(user_input: str, available_tools:list, invalid_tools:li
         SystemMessage(content=PLANNER_PROMPT),
         HumanMessage(content=retry_prompt)
     ])
-    return _retrieve_plan(response)
+    return _retrieve_plan(response.content)
