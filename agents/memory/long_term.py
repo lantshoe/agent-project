@@ -116,10 +116,10 @@ class LongTermMemory:
         llm = get_llm(skill=Skill.REASONING)
 
         try:
-            PROFILE_MERGE_USER_PROMPT.format(old_profile=json.dumps(old_profile), session_observations=json.dumps(session_observations))
+            format = PROFILE_MERGE_USER_PROMPT.format(old_profile=json.dumps(old_profile), session_observations=json.dumps(session_observations))
             response = llm.invoke([
                 SystemMessage(content=PROFILE_MERGE_SYSTEM_PROMPT),
-                HumanMessage(content=PROFILE_MERGE_USER_PROMPT)
+                HumanMessage(content=format)
             ])
             content = response.content.strip()
             if content.startswith("```"):

@@ -50,10 +50,10 @@ def evaluate_execution_quality(user_input: str, plan: list, completed_steps: lis
         for s in completed_steps
     ]) if completed_steps else "No steps recorded"
     try:
-        EVALUATOR_USER_PROMPT.format(user_input=user_input, plan_text=plan_text,steps_text = steps_text,final_answer=final_answer)
+        formatted = EVALUATOR_USER_PROMPT.format(user_input=user_input, plan_text=plan_text,steps_text = steps_text,final_answer=final_answer)
         response = llm.invoke([
             SystemMessage(content=EVALUATOR_SYSTEM_PROMPT),
-            HumanMessage(content=EVALUATOR_USER_PROMPT),
+            HumanMessage(content=formatted),
         ])
         content = response.content.strip()
         logger.debug(f"content: {content}")
