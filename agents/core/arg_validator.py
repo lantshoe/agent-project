@@ -10,10 +10,11 @@ def get_tool_schema(tool: BaseTool) -> dict:
    Extracts field definitions from a tool's schema.
    Returns: {field_name: {"required": bool, "type": type, "description": str}}
    """
-    schema = getattr(tool, "args_schema", None)
-    if not schema:
+    schema_cls = getattr(tool, "args_schema", None)
+    if not schema_cls:
         return {}
 
+    schema = schema_cls.model_json_schema()
     fields = {}
     required_fields = schema.get('required') or []
     for name, detail in (schema.get('properties') or {}).items():
