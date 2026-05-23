@@ -302,7 +302,7 @@ def count_column(filepath: str, sheet_name: str, column: str):
             "column": {"type": "string"},
             "operator": {
                 "type": "string",
-                "description": "One of: '>', '<', '>=', '<=', '==', '!=', 'contains'"
+                "enum": [">", "<", ">=", "<=", "==", "!=", "contains"]
             },
             "value": {"description": "Value to compare against"}
         },

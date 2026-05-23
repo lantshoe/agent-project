@@ -1,18 +1,19 @@
 import asyncio
-from typing import Annotated
 from datetime import datetime
+from typing import Annotated
+
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
-from agents.core.executor import execute_next_step
+
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
-from agents.core.models import PlanStep, StepRecord
-from agents.core.planner import create_plan
+from agents.core.models import StepRecord, BudgetState
 from agents.core.skill_enum import Skill
 from agents.core.tool_node import make_tool_node
+from agents.core.verifier import verify_step
 from agents.memory.evaluator import evaluate_execution_quality
 from agents.memory.long_term import LongTermMemory
 from agents.tools.calculator import calculator
@@ -41,8 +42,16 @@ Tool execution is handled externally.
 You only decide WHICH tool to call and WITH WHAT arguments.
 """
 
+
 def _merge_steps(old: list[StepRecord], new: list[StepRecord]) -> list[StepRecord]:
     return old + new
+
+
+def _merge_budgets(old: list[BudgetState], new: list[BudgetState]) -> list[BudgetState]:
+    # only keep the newest one
+    return new if new else old
+
+
 # Agent State
 class AgentState(TypedDict):
     """
@@ -51,8 +60,9 @@ class AgentState(TypedDict):
     """
     messages: Annotated[list, add_messages]
     completed_steps: Annotated[list[StepRecord], _merge_steps]
-    plan: list[PlanStep]
-    current_step: int
+    budget: Annotated[list[BudgetState], _merge_budgets]
+    retry_counts: dict[str, int]
+
 
 def clean_message_history(messages: list) -> list:
     """
@@ -81,9 +91,7 @@ def clean_message_history(messages: list) -> list:
             if not matched:
                 continue
             # when some tool calls dont have corresponding tool message
-            if len(matched) < len(msg.tool_calls):
-                msg = msg.model_copy(update={"tool_calls": matched[:1], "additional_kwargs": {}})
-            elif len(matched) > 1:
+            if len(matched) != len(msg.tool_calls):
                 msg = msg.model_copy(update={"tool_calls": matched[:1], "additional_kwargs": {}})
 
         if isinstance(msg, ToolMessage):
@@ -93,12 +101,121 @@ def clean_message_history(messages: list) -> list:
     return cleaned
 
 
+def build_agent(tools):
+    def call_llm(state: AgentState) -> dict:
+        """
+        single ReAct seasoning step.
+        The LLM sees the full message history and decides what to do next.
+        No planner, No executor, just think then act.
+        """
+        budget: BudgetState = state["budget"][-1]
+        if budget.is_exhausted:
+            reason = (
+                f"Maximum steps reached {budget.max_steps} "
+                if budget.is_over_steps
+                else f"Maximum steps reached {budget.max_steps}"
+            )
+            logger.warning(f"[budget] exhausted {budget.summary()}]")
+            llm = get_llm(skill=Skill.REASONING)
+            llm_response = llm.invoke(
+                [SystemMessage(content=(
+                    f"You have reached the budget limit: {reason}. "
+                    "Summarise what was accomplished so far and explain what remains"
+                ))]
+                + state["messages"]
+            )
+            return {"messages": [llm_response]}
+
+        llm = get_llm(skill=Skill.REASONING)
+        llm_with_tools = llm.bind_tools(tools)
+        cleaned = clean_message_history(state["messages"])
+        response_with_tool = llm_with_tools.invoke(
+            [SystemMessage(content=SYSTEM_PROMPT)] + cleaned
+        )
+        logger.debug(f"[llm] tool_calls: {[t['name'] for t in getattr(response_with_tool, 'tool_calls', [])]}")
+        return {"messages": [response_with_tool]}
+
+    graph = StateGraph(AgentState)
+    graph.add_node("llm", call_llm)
+    graph.add_node("verifier",run_verifier)
+    graph.add_node("tools", make_tool_node(tools))
+    graph.add_node("budget", increase_budget)
+
+    graph.set_entry_point("llm")
+    graph.add_conditional_edges("llm", should_use_tool)
+    # tools -> budget -> verifier -> llm
+    # after executing a tool need to update budget
+    # then use verifier to check if over budget or other problems
+    # then back to llm making decisions
+    graph.add_edge("tools", "budget")
+    graph.add_edge("budget", "verifier")
+    graph.add_edge("verifier", "llm")
+    return graph.compile()
+
+
+
+def run_verifier(state: AgentState) -> dict:
+    """
+    Run after tool execution.
+    Inspect the latest StepRecord and decide continue or retry or skip or escalate.
+    Inject a hint message into history on retry so the LLM corrects itself.
+    """
+    completed = state["completed_steps"]
+    if not completed:
+        return {}
+    latest_step = completed[-1]
+    retry_counts = dict(state.get("retry_counts", {}))
+    retry_count = retry_counts.get(latest_step.tool, 0)
+
+    decision = verify_step(latest_step, retry_count)
+    logger.debug(f"[verifier] {latest_step.tool} → {decision.action}: {decision.reason}")
+
+    if decision.action == "retry":
+        retry_counts[latest_step.tool] = retry_count + 1
+        hint_msg = SystemMessage(content=(
+            f"The previous call to '{latest_step.tool}' failed. "
+            f"Hint: {decision.hint} "
+            f"Please try again with corrected arguments."
+        ))
+        return {
+            "messages": [hint_msg],
+            "retry_counts": retry_counts,
+        }
+    if decision.action == "escalate":
+        stop_msg = SystemMessage(content=(
+            f"Escalation: '{latest_step.tool}' failed critically after retries. "
+            f"Reason: {decision.reason}."
+            f"Stop execution and explain the failure to the user."
+        ))
+        return {
+            "messages": [stop_msg],
+        }
+    if decision.action == "skip":
+        skip_msg = SystemMessage(content=(
+            f"'{latest_step.tool}' failed and was skipped. '"
+            f"Reason: {decision.reason}."
+            "Continue with the remaining tasks if any."
+        ))
+        return {
+            "messages": [skip_msg],
+        }
+    # nothing to inject, continue
+    return {}
+
+def increase_budget(state: AgentState) -> dict:
+    """increase steps_used after each tool execution."""
+    budget = state["budget"][-1].increment()
+    logger.debug(f"[budget] {budget.summary()}")
+    return {"budget": [budget]}
+
 # routing logic
 def should_use_tool(state: AgentState) -> str:
+    if state['budget'][-1].is_exhausted:
+        return END
+
     last_message = state["messages"][-1]
     tool_calls = getattr(last_message, "tool_calls", [])
-    logger.debug(f"last_message: {last_message}")
-    logger.debug(f"tool_calls: {tool_calls}")
+
     if tool_calls:
         logger.debug(f"Thought → Action: {[t['name'] for t in tool_calls]}")
         return "tools"
@@ -106,59 +223,7 @@ def should_use_tool(state: AgentState) -> str:
     return END
 
 
-def build_agent(tools):
-    def call_llm(state: AgentState) -> AgentState:
-        plan: list[PlanStep] = state.get("plan", [])
-        completed: list[StepRecord] = state.get("completed_steps", [])
-        completed_tool_names = {s.tool for s in completed if s.succeeded}
-        logger.debug(f"completed tools: {completed}")
-        if plan:
-            remaining = [
-                s for s in plan
-                if s.tool not in completed_tool_names
-            ]
-
-            if not remaining:
-                # All steps done , ask LLM for final answer only
-                llm = get_llm(skill=Skill.REASONING)
-                response = llm.invoke([SystemMessage(content="All tasks are complete. Summarize the results clearly.")]
-                                    + state["messages"])
-                return {"messages": [response]}
-
-            next_step = remaining[0]
-            logger.debug(f"Executor → next step: {next_step.tool} ({next_step.reason})")
-            clean_history = clean_message_history(state["messages"])
-            response = execute_next_step(
-                next_tool=next_step.tool,
-                next_reason=next_step.reason,
-                tools=tools,
-                messages=clean_history,
-            )
-
-
-        else:
-            logger.debug("No plan — free ReAct mode")
-            llm = get_llm(skill=Skill.REASONING)
-            llm_with_tools = llm.bind_tools(tools)
-            clean_history = clean_message_history(state["messages"])
-            response = llm_with_tools.invoke(
-                [SystemMessage(content=SYSTEM_PROMPT)] + clean_history
-            )
-            if hasattr(response, "tool_calls") and len(response.tool_calls) > 1:
-                response.tool_calls = [response.tool_calls[0]]
-        return {"messages": [response]}
-
-    graph = StateGraph(AgentState)
-    graph.add_node("llm", call_llm)
-    graph.add_node("tools", make_tool_node(tools))
-    graph.set_entry_point("llm")
-    graph.add_conditional_edges("llm", should_use_tool)
-    graph.add_edge("tools", "llm")
-
-    return graph.compile()
-
-
-async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
+async def run_agent_async(user_input: str, user_id: str = 'default', max_steps:int= 20, max_seconds: int = 300,) -> str:
     """
     Main async entry point.
     MCP client stays alive for the full duration of the agent run.
@@ -169,35 +234,31 @@ async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
 
     memory = LongTermMemory(user_id=user_id)
     memory_context = memory.format_for_llm(user_input)
+
+    initial_messages = [HumanMessage(content=user_input)]
     if memory_context:
         logger.debug(f"Memory context: {memory_context}")
+        initial_messages.insert(0, HumanMessage(content = f"Relevant context from past sessions:\n{memory_context}"))
 
-    logger.debug("Planning...")
-    plan = create_plan(user_input, all_tools, memory_context = memory_context)
-    if plan:
-        plan_text = "\n".join([f"  Step {s.step}: {s.tool} — {s.reason}" for s in plan])
-        logger.debug(f"Plan: {plan_text}")
-    else:
-        logger.debug("No plan generated — executor will decide")
-
+    budget = BudgetState(max_steps=max_steps, max_seconds=max_seconds)
     agent = build_agent(all_tools)
 
     result = await agent.ainvoke({
-        "messages": [HumanMessage(content=user_input)],
+        "messages": initial_messages,
         "completed_steps": [],
-        "plan": plan,
-        "current_step": 0,
+        "budget": [budget],
+        "retry_counts": {},
     })
 
     final_answer = result["messages"][-1].content
-    completed_steps = result.get("completed_steps",[])
-
+    completed_steps = result.get("completed_steps", [])
+    final_budget: BudgetState = result["budget"][-1]
+    logger.debug(f"Run complete - {final_budget.summary()}")
     steps_as_dicts = [s.model_dump() for s in completed_steps]
-    plan_as_dicts = [s.model_dump() for s in plan] if plan else []
 
     evaluation = evaluate_execution_quality(
         user_input=user_input,
-        plan = plan_as_dicts,
+        plan=[],
         completed_steps=steps_as_dicts,
         final_answer=final_answer,
     )
@@ -213,6 +274,7 @@ async def run_agent_async(user_input: str, user_id: str = 'default') -> str:
         "last_task": user_input[:100],
         "tools_used": list({s.tool for s in completed_steps}),
         "task_quality": evaluation.get("quality"),
+        "steps_used": final_budget.steps_used,
         "session_date": datetime.now().isoformat()
     })
 

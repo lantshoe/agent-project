@@ -93,7 +93,7 @@ class BudgetState(BaseModel):
     max_steps: int = 20
     max_seconds: int = 300
     started_at: datetime = Field(default_factory=datetime.now)
-    step_used: int = 0
+    steps_used: int = 0
 
     @property
     def steps_remaining(self) -> int:
