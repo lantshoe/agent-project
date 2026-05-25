@@ -68,20 +68,19 @@ def _correct_type(tool:BaseTool, args:dict, schema:dict,warnings,fixed ):
             continue
         try:
             # Handle common mismatches
-            origin = getattr(expected_type, "__origin__", None)
-            if expected_type == str and not isinstance(value, str):
+            if expected_type == "string" and not isinstance(value, str):
                 fixed[key] = str(value)
                 warnings.append(f"Coerced '{key}' to str")
 
-            elif expected_type == int and isinstance(value, float):
+            elif expected_type == "integer" and isinstance(value, float):
                 fixed[key] = int(value)
                 warnings.append(f"Coerced '{key}' to int")
 
-            elif expected_type == bool and isinstance(value, str):
+            elif expected_type == "boolean" and isinstance(value, str):
                 fixed[key] = value.lower() in {"true", "1", "yes"}
                 warnings.append(f"Coerced '{key}' to bool")
 
-            elif expected_type == list and isinstance(value, str):
+            elif expected_type == "array" and isinstance(value, str):
                 import json
                 fixed[key] = json.loads(value)
                 warnings.append(f"Coerced '{key}' from str to list")
