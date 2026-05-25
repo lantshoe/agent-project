@@ -11,6 +11,7 @@ from typing_extensions import TypedDict
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
 from agents.core.models import StepRecord, BudgetState
+from agents.core.run_logger import RunLogger
 from agents.core.skill_enum import Skill
 from agents.core.tool_node import make_tool_node
 from agents.core.verifier import verify_step
@@ -101,7 +102,7 @@ def clean_message_history(messages: list) -> list:
     return cleaned
 
 
-def build_agent(tools):
+def build_agent(tools:list, run_log: RunLogger):
     def call_llm(state: AgentState) -> dict:
         """
         single ReAct seasoning step.
@@ -124,17 +125,68 @@ def build_agent(tools):
                 ))]
                 + state["messages"]
             )
+            record_usage(run_log, llm_response)
             return {"messages": [llm_response]}
-
-        llm = get_llm(skill=Skill.REASONING)
-        llm_with_tools = llm.bind_tools(tools)
-        cleaned = clean_message_history(state["messages"])
-        response_with_tool = llm_with_tools.invoke(
-            [SystemMessage(content=SYSTEM_PROMPT)] + cleaned
-        )
-        logger.debug(f"[llm] tool_calls: {[t['name'] for t in getattr(response_with_tool, 'tool_calls', [])]}")
+        else:
+            llm = get_llm(skill=Skill.REASONING)
+            llm_with_tools = llm.bind_tools(tools)
+            cleaned = clean_message_history(state["messages"])
+            response_with_tool = llm_with_tools.invoke(
+                [SystemMessage(content=SYSTEM_PROMPT)] + cleaned
+            )
+            logger.debug(f"[llm] tool_calls: {[t['name'] for t in getattr(response_with_tool, 'tool_calls', [])]}")
+            record_usage(run_log, response_with_tool)
         return {"messages": [response_with_tool]}
 
+    def run_verifier(state: AgentState) -> dict:
+        """
+        Run after tool execution.
+        Inspect the latest StepRecord and decide continue or retry or skip or escalate.
+        Inject a hint message into history on retry so the LLM corrects itself.
+        """
+        completed = state["completed_steps"]
+        if not completed:
+            return {}
+        latest_step = completed[-1]
+        retry_counts = dict(state.get("retry_counts", {}))
+        retry_count = retry_counts.get(latest_step.tool, 0)
+
+        decision = verify_step(latest_step, retry_count)
+        logger.debug(f"[verifier] {latest_step.tool} → {decision.action}: {decision.reason}")
+        run_log.record_step(latest_step, decision)
+
+        if decision.action == "retry":
+            retry_counts[latest_step.tool] = retry_count + 1
+            hint_msg = SystemMessage(content=(
+                f"The previous call to '{latest_step.tool}' failed. "
+                f"Hint: {decision.hint} "
+                f"Please try again with corrected arguments."
+            ))
+            run_log.increment_retry(latest_step.tool)
+            return {
+                "messages": [hint_msg],
+                "retry_counts": retry_counts,
+            }
+        if decision.action == "escalate":
+            stop_msg = SystemMessage(content=(
+                f"Escalation: '{latest_step.tool}' failed critically after retries. "
+                f"Reason: {decision.reason}."
+                f"Stop execution and explain the failure to the user."
+            ))
+            return {
+                "messages": [stop_msg],
+            }
+        if decision.action == "skip":
+            skip_msg = SystemMessage(content=(
+                f"'{latest_step.tool}' failed and was skipped. '"
+                f"Reason: {decision.reason}."
+                "Continue with the remaining tasks if any."
+            ))
+            return {
+                "messages": [skip_msg],
+            }
+        # nothing to inject, continue
+        return {}
     graph = StateGraph(AgentState)
     graph.add_node("llm", call_llm)
     graph.add_node("verifier",run_verifier)
@@ -154,53 +206,6 @@ def build_agent(tools):
 
 
 
-def run_verifier(state: AgentState) -> dict:
-    """
-    Run after tool execution.
-    Inspect the latest StepRecord and decide continue or retry or skip or escalate.
-    Inject a hint message into history on retry so the LLM corrects itself.
-    """
-    completed = state["completed_steps"]
-    if not completed:
-        return {}
-    latest_step = completed[-1]
-    retry_counts = dict(state.get("retry_counts", {}))
-    retry_count = retry_counts.get(latest_step.tool, 0)
-
-    decision = verify_step(latest_step, retry_count)
-    logger.debug(f"[verifier] {latest_step.tool} → {decision.action}: {decision.reason}")
-
-    if decision.action == "retry":
-        retry_counts[latest_step.tool] = retry_count + 1
-        hint_msg = SystemMessage(content=(
-            f"The previous call to '{latest_step.tool}' failed. "
-            f"Hint: {decision.hint} "
-            f"Please try again with corrected arguments."
-        ))
-        return {
-            "messages": [hint_msg],
-            "retry_counts": retry_counts,
-        }
-    if decision.action == "escalate":
-        stop_msg = SystemMessage(content=(
-            f"Escalation: '{latest_step.tool}' failed critically after retries. "
-            f"Reason: {decision.reason}."
-            f"Stop execution and explain the failure to the user."
-        ))
-        return {
-            "messages": [stop_msg],
-        }
-    if decision.action == "skip":
-        skip_msg = SystemMessage(content=(
-            f"'{latest_step.tool}' failed and was skipped. '"
-            f"Reason: {decision.reason}."
-            "Continue with the remaining tasks if any."
-        ))
-        return {
-            "messages": [skip_msg],
-        }
-    # nothing to inject, continue
-    return {}
 
 def increase_budget(state: AgentState) -> dict:
     """increase steps_used after each tool execution."""
@@ -241,7 +246,9 @@ async def run_agent_async(user_input: str, user_id: str = 'default', max_steps:i
         initial_messages.insert(0, HumanMessage(content = f"Relevant context from past sessions:\n{memory_context}"))
 
     budget = BudgetState(max_steps=max_steps, max_seconds=max_seconds)
-    agent = build_agent(all_tools)
+    run_log = RunLogger(user_id=user_id, user_input=user_input)
+
+    agent = build_agent(all_tools,run_log)
 
     result = await agent.ainvoke({
         "messages": initial_messages,
@@ -262,6 +269,12 @@ async def run_agent_async(user_input: str, user_id: str = 'default', max_steps:i
         completed_steps=steps_as_dicts,
         final_answer=final_answer,
     )
+    log_path = run_log.finish(
+        final_answer=final_answer,
+        budget=final_budget,
+        evaluation=evaluation,
+    )
+    logger.debug(f"Run log: {log_path}")
 
     memory.store_episode(
         user_input=user_input,
@@ -280,6 +293,20 @@ async def run_agent_async(user_input: str, user_id: str = 'default', max_steps:i
 
     return final_answer
 
+def record_usage(run_log, msg):
+
+    usage = getattr(msg, "usage_metadata", None)
+    input_tokens = usage.get("input_tokens", 0) if usage else 0
+    output_tokens = usage.get("output_tokens", 0) if usage else 0
+    run_log.record_llm_call(
+        input_tokens=input_tokens,
+        output_tokens= output_tokens,
+    )
+    logger.debug(
+            f"[llm] tool_calls={[t['name'] for t in getattr(msg, 'tool_calls', [])]} | "
+            f"tokens={input_tokens}in/"
+            f"{output_tokens}out"
+        )
 
 # ── 5. Sync wrapper ────────────────────────────────────────────────────────────
 def run_agent(user_input: str, user_id: str = "default") -> str:
@@ -313,4 +340,6 @@ if __name__ == "__main__":
     | Widget D | 1500    | 30    |
     Then calculate the average revenue, find the max revenue, and filter products where revenue > 4000.
     ''')
+    # response = run_agent("Search for 'what is asyncio' and calculate 999 * 888 at the same time")
+
     print(response)
