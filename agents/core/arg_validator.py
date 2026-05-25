@@ -1,4 +1,5 @@
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel
 
 from agents.core.logger import get_logger
 
@@ -14,6 +15,8 @@ def get_tool_schema(tool: BaseTool) -> dict:
     if not schema:
         return {}
 
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        schema = schema.model_json_schema()
     fields = {}
     required_fields = schema.get('required') or []
     for name, detail in (schema.get('properties') or {}).items():
