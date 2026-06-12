@@ -40,29 +40,6 @@ class AgentState(TypedDict):
     budget: Annotated[list[BudgetState], _merge_budgets]
     retry_counts: dict[str, int]
 
-def clean_message_history(message: list) -> list:
-    """
-    ensure every AIMessage with tool_calls has a matching ToolMessage.
-    drop both sides of any orphaned pair to keep the conversation valid.
-    """
-    present_ids: set[str] = {
-        msg.tool_call_id for msg in message if isinstance(msg, ToolMessage)
-    }
-    cleaned = []
-    for msg in message:
-        if isinstance(msg, ToolMessage) and msg.tool_call_id in present_ids:
-            continue
-
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            matched = [tc for tc in msg.tool_calls if tc["id"] in present_ids]
-            if not matched:
-                continue
-
-            if len(matched) != len(msg.tool_calls):
-                msg = msg.model_copy(update={"tool_calls": matched, "additional_kwargs": {}})
-        cleaned.append(msg)
-    return cleaned
-
 class BaseAgent:
     """
     the shared ReAct loop every subagent built on
@@ -186,16 +163,14 @@ class BaseAgent:
                 return {"messages": [response]}
             llm = get_llm(skill=Skill.REASONING)
             llm_with_tools = llm.bind_tools(tools)
-            clean_history = clean_message_history(state["messages"])
             response = llm_with_tools.invoke(
-                [SystemMessage(content=system_prompt)] + clean_history
+                [SystemMessage(content=system_prompt)] + state["messages"]
             )
             _record_tokens(response, run_log)
             logger.debug(
                 f"[llm] tool_calls={[t['name'] for t in getattr(response, 'tool_calls', [])]}"
             )
             return {"messages": [response]}
-
 
         def run_verifier(state: AgentState) -> dict:
             completed = state["completed_steps"]
@@ -213,7 +188,7 @@ class BaseAgent:
                 retry_counts[latest_step.tool] = retry_count + 1
                 run_log.increment_retry(latest_step.tool)
                 return {
-                    "messages": [SystemMessage(content=(
+                    "messages": [HumanMessage(content=(
                         f"The previous call to '{latest_step.tool}' failed. "
                         f"Hint: {decision.hint} Try again with corrected arguments."
                     ))],
@@ -221,13 +196,13 @@ class BaseAgent:
                 }
 
             if decision.action == "escalate":
-                return {"messages": [SystemMessage(content=(
+                return {"messages": [HumanMessage(content=(
                     f"ESCALATION: '{latest_step.tool}' failed critically. "
                     f"Reason: {decision.reason}. Stop and explain the failure."
                 ))]}
 
             if decision.action == "skip":
-                return {"messages": [SystemMessage(content=(
+                return {"messages": [HumanMessage(content=(
                     f"'{latest_step.tool}' failed and was skipped. "
                     f"Reason: {decision.reason}. Continue with remaining tasks."
                 ))]}
