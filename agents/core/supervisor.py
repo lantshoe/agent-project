@@ -1,6 +1,4 @@
 """
-
-
 the supervisor agent - orchestrates specialist subagents to complete complex tasks
  that benefit from parallelism and specialization.
 
@@ -11,25 +9,20 @@ responsibilities:
     aggregate subagent results into a final answer
 """
 
-
 from __future__ import annotations
 
 import asyncio
 import json
 from datetime import datetime
-from typing import Any, Coroutine
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from agents.models import SubagentResult
 from agents.myagent.base_agent import BaseAgent
 from agents.myagent.data_agent import make_data_agent
 from agents.myagent.research_agent import make_research_agent
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
-from agents.core.models import BudgetState
-from agents.core.run_logger import RunLogger
 from agents.core.skill_enum import Skill
 from agents.execution.checkpointer import make_run_id
 from agents.memory.evaluator import evaluate_execution_quality
@@ -47,7 +40,7 @@ from agents.tools.search import web_search
 
 logger = get_logger("supervisor")
 
-DECOMPOSE_SYSTEM_PROMPT = """You are a task supervisor. Given a usr request,
+DECOMPOSE_SYSTEM_PROMPT = """You are a task supervisor. Given a user request,
 decompose it into a list of tasks for specialist agents.
 
 Available agent types:
@@ -67,6 +60,9 @@ RULES:
 - Only add depends_on when a task genuinely needs results from another
 - Be specific in instructions — the subagent only sees its own instruction
 - If a task needs output from a prior task, say so explicitly in the instruction
+- If multiple tasks will write to the SAME Excel file, each task must write
+  to a DIFFERENT sheet name to avoid concurrent writes to the same sheet.
+  Specify the sheet name explicitly in each task's instruction.
 
 Respond ONLY with a valid JSON object:
 {
@@ -76,23 +72,23 @@ Respond ONLY with a valid JSON object:
 }
 """
 
-AGGREGATE_SYSTEM_PROMPT = """ You are a supervisor synthesizing results
+AGGREGATE_SYSTEM_PROMPT = """You are a supervisor synthesizing results
 from specialist agents into a final answer for the user.
 
 Write a clear, complete response that:
 - Directly answers the user's original request
-- Integrates all successful results naturally
+- Integrates all successful results naturally — include specific facts,
+  figures, and names from the results, not just descriptions of what was done
 - Acknowledges any tasks that failed or were partial
 - Does not expose internal agent details to the user
 """
 
-def decompose_task(user_input:str, memory_context:str = "")->DelegationPlan:
+def decompose_task(user_input: str, memory_context: str = "") -> DelegationPlan:
     """
     call the llm to compose user input into a DelegationPlan.
     validates the output against typed models - bad agent types raise immediately.
     """
-
-    llm = get_llm(skill = Skill.REASONING)
+    llm = get_llm(skill=Skill.REASONING)
     memory_section = (
         f"Relevant context from past sessions:\n{memory_context}\n\n"
         if memory_context else ""
@@ -100,7 +96,7 @@ def decompose_task(user_input:str, memory_context:str = "")->DelegationPlan:
 
     response = llm.invoke([
         SystemMessage(content=DECOMPOSE_SYSTEM_PROMPT),
-        HumanMessage(content=f"{memory_section} User reqeust: {user_input}"),
+        HumanMessage(content=f"{memory_section}User request: {user_input}"),
     ])
 
     try:
@@ -114,8 +110,8 @@ def decompose_task(user_input:str, memory_context:str = "")->DelegationPlan:
         tasks = [Task(**t) for t in raw["tasks"]]
         plan = DelegationPlan(
             tasks=tasks,
-            reasoning=raw.get("reasoning",""),
-            strategy = raw.get("strategy","parallel"),
+            reasoning=raw.get("reasoning", ""),
+            strategy=raw.get("strategy", "parallel"),
         )
         logger.debug(f"[supervisor] plan: {plan.summary()}")
         logger.debug(f"[supervisor] reasoning: {plan.reasoning}")
@@ -133,7 +129,7 @@ def decompose_task(user_input:str, memory_context:str = "")->DelegationPlan:
             strategy="sequential",
         )
 
-def make_agent_for_task(task:Task, mcp_tools:list)->BaseAgent:
+def make_agent_for_task(task: Task, mcp_tools: list) -> BaseAgent:
     if task.agent_type == AgentType.RESEARCH:
         return make_research_agent()
     if task.agent_type == AgentType.DATA:
@@ -142,6 +138,11 @@ def make_agent_for_task(task:Task, mcp_tools:list)->BaseAgent:
     GENERALIST_PROMPT = """
     You are a general-purpose agent. Use whatever tools are available to
     complete the task. Think step by step and use tools when needed.
+
+    If your context includes "file_state", it tells you which files and
+    sheets already exist. Use write_sheet (NOT create_workbook) to add a
+    new sheet to an existing file — only use create_workbook if the file
+    doesn't exist yet according to file_state.
 
     FILESYSTEM RULES:
     Sandbox root: agent_workspace
@@ -153,24 +154,33 @@ def make_agent_for_task(task:Task, mcp_tools:list)->BaseAgent:
         agent_type=AgentType.GENERALIST,
     )
 
+
 async def dispatch_tasks(
         tasks: list[Task],
         mcp_tools: list,
         user_id: str,
-        state: SupervisorState
+        completed_results: list[SubagentResult],
 ) -> list[SubagentResult]:
     """
     runs a batch of tasks concurrently with asyncio.gather()
     each task gets its own agent instance and its own context window.
+
+    completed_results is a snapshot of results from prior rounds —
+    passed explicitly (not read from shared state) to avoid the
+    closure-timing bug where state.results was empty when read.
     """
 
     async def run_one(task: Task) -> SubagentResult:
         for dep_id in task.depends_on:
             dep_result = next(
-                (r for r in state.results if r.task_id == dep_id),None
+                (r for r in completed_results if r.task_id == dep_id), None
             )
             if dep_result and dep_result.usable:
-                task = task.with_context(dep_id, dep_result.answer)
+                context_payload = {"summary": dep_result.answer}
+                file_state = dep_result.metadata.get("file_state")
+                if file_state:
+                    context_payload["file_state"] = file_state
+                task = task.with_context(dep_id, context_payload)
 
         agent = make_agent_for_task(task, mcp_tools)
         return await agent.run(task=task, user_id=user_id)
@@ -198,8 +208,10 @@ async def dispatch_tasks(
             clean.append(r)
     return clean
 
-def handle_failures(results:list[SubagentResult], plan:DelegationPlan
-                    )->tuple[list[SubagentResult], list[SubagentResult]]:
+def handle_failures(
+        results: list[SubagentResult],
+        plan: DelegationPlan,
+) -> tuple[list[SubagentResult], list[SubagentResult]]:
     """
     split results into usable and failed.
     decision logic:
@@ -223,7 +235,7 @@ def handle_failures(results:list[SubagentResult], plan:DelegationPlan
         logger.error("[supervisor] All tasks failed — no usable results")
     return usable, failed
 
-def aggregate_results(user_input: str, state:SupervisorState) -> str:
+def aggregate_results(user_input: str, state: SupervisorState) -> str:
     """
     calls the LLM to synthesize all subagent results into a final answer.
     The LLM sees clean summaries - not raw tool call histories.
@@ -252,10 +264,11 @@ def aggregate_results(user_input: str, state:SupervisorState) -> str:
     ])
     return response.content
 
+
 async def run_multiagent(
-        user_input:str,
-        user_id:str = "default",
-        max_seconds: int = 600
+        user_input: str,
+        user_id: str = "default",
+        max_seconds: int = 600,
 ) -> str:
     run_id = make_run_id(user_id=user_id)
     start_time = datetime.now()
@@ -293,7 +306,7 @@ async def run_multiagent(
             tasks=ready,
             mcp_tools=mcp_tools,
             user_id=user_id,
-            state=state,
+            completed_results=list(state.results),
         )
 
         usable, failed = handle_failures(batch_results, plan)
@@ -301,7 +314,7 @@ async def run_multiagent(
             state.add_result(r)
 
         completed_ids = {r.task_id for r in batch_results}
-        remaining= [t for t in remaining if t.task_id not in completed_ids]
+        remaining = [t for t in remaining if t.task_id not in completed_ids]
         logger.debug(
             f"[supervisor] Round {rounds}: "
             f"{len(usable)} succeeded, {len(failed)} failed, "
@@ -361,10 +374,6 @@ async def run_multiagent(
 
     return final_answer
 
-
-
-
-
 def run_multiagent_sync(user_input: str, user_id: str = "default") -> str:
     """Sync wrapper for convenience."""
     try:
@@ -382,41 +391,9 @@ def run_multiagent_sync(user_input: str, user_id: str = "default") -> str:
 
 
 if __name__ == "__main__":
-    # response = run_multiagent_sync("""
-    # Research the top 3 AI companies by revenue in 2025,
-    # then create an Excel file called ai_companies.xlsx
-    # and write the research results to it.
-    # """)
-
     response = run_multiagent_sync("""
-     Create an Excel file called sales.xlsx with this data:
-    | product  | revenue | units |
-    | Widget A | 5000    | 100   |
-    | Widget B | 3000    | 60    |
-    | Widget C | 8000    | 160   |
-    | Widget D | 1500    | 30    |
-    Then calculate the average revenue, find the max revenue, and filter products where revenue > 4000.
+    Research the top 3 AI companies by revenue in 2025,
+    then create an Excel file called ai_companies.xlsx
+    and write the research results to it.
     """)
-
     print(response)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

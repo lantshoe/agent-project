@@ -8,7 +8,7 @@ Extracted from agent.py,
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 import traceback
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -28,6 +28,10 @@ from agents.models.supervisor import AgentType, Task, SubagentResult
 
 logger = get_logger("base_agent")
 
+# Tools that create or write to files — used to build file_state
+# so downstream tasks know what files/sheets already exist.
+FILE_STATE_TOOLS = {"create_workbook", "write_sheet"}
+
 def _merge_steps(old: list[StepRecord], new: list[StepRecord]) -> list[StepRecord]:
     return old + new
 
@@ -39,6 +43,29 @@ class AgentState(TypedDict):
     completed_steps: Annotated[list[StepRecord], _merge_steps]
     budget: Annotated[list[BudgetState], _merge_budgets]
     retry_counts: dict[str, int]
+
+
+def _extract_file_state(completed_steps: list[StepRecord]) -> dict[str, list[str]]:
+    """
+    Scans completed steps for create_workbook/write_sheet calls and builds
+    a map of {filepath: [sheet_names]} reflecting what currently exists.
+
+    This lets downstream tasks know which files/sheets already exist so
+    they use write_sheet (not create_workbook) to add new sheets, and
+    don't waste steps re-discovering structure via list_sheets.
+    """
+    files: dict[str, set[str]] = {}
+    for step in completed_steps:
+        if step.tool in FILE_STATE_TOOLS and step.succeeded:
+            filepath = step.args.get("filepath")
+            sheet    = step.args.get("sheet_name")
+            if not filepath:
+                continue
+            files.setdefault(filepath, set())
+            if sheet:
+                files[filepath].add(sheet)
+    return {fp: sorted(sheets) for fp, sheets in files.items()}
+
 
 class BaseAgent:
     """
@@ -72,7 +99,7 @@ class BaseAgent:
         )
         content = task.instruction
         if task.context:
-            context_str = "\n".join(f" {k}:{v}" for k, v in task.context.items())
+            context_str = "\n".join(f" {k}: {v}" for k, v in task.context.items())
             content = f"{task.instruction} \n\n Context from prior tasks:\n{context_str}"
 
         initial_messages = [HumanMessage(content=content)]
@@ -92,7 +119,6 @@ class BaseAgent:
             })
             final_answer: str = _extract_final_answer(result["messages"])
 
-            # final_answer:str = result["messages"][-1].content
             completed_steps: list[StepRecord] = result.get("completed_steps", [])
             final_budget: BudgetState = result['budget'][-1]
 
@@ -106,6 +132,7 @@ class BaseAgent:
                 status = "partial"
             else:
                 status = "success"
+
             run_log.finish(
                 final_answer,
                 budget=budget,
@@ -116,6 +143,11 @@ class BaseAgent:
                 f"status={status} | steps={final_budget.steps_used} | "
                 f"time={duration_s:.1f}s"
             )
+
+            file_state = _extract_file_state(completed_steps)
+            if file_state:
+                logger.debug(f"[{self.agent_type}:{task.task_id}] file_state: {file_state}")
+
             return SubagentResult(
                 task_id=task.task_id,
                 agent_type=self.agent_type,
@@ -123,6 +155,7 @@ class BaseAgent:
                 answer=final_answer,
                 steps_taken=[s.tool for s in completed_steps],
                 duration_s=duration_s,
+                metadata={"file_state": file_state} if file_state else {},
             )
         except Exception as e:
             duration_s = (datetime.now() - start_at).total_seconds()
@@ -161,11 +194,29 @@ class BaseAgent:
                 )
                 _record_tokens(response, run_log)
                 return {"messages": [response]}
+
             llm = get_llm(skill=Skill.REASONING)
             llm_with_tools = llm.bind_tools(tools)
             response = llm_with_tools.invoke(
                 [SystemMessage(content=system_prompt)] + state["messages"]
             )
+
+            # Structural guard: create_workbook must never run alongside
+            # other tools — it must complete first so subsequent writes
+            # target an existing file. The LLM repeatedly batches these
+            # together despite prompt instructions, so we enforce it here.
+            if hasattr(response, "tool_calls") and len(response.tool_calls) > 1:
+                tool_names = [tc["name"] for tc in response.tool_calls]
+                if "create_workbook" in tool_names:
+                    logger.debug(
+                        f"[{self.agent_type}] create_workbook batched with "
+                        f"{tool_names} — isolating to create_workbook only"
+                    )
+                    create_call = next(
+                        tc for tc in response.tool_calls if tc["name"] == "create_workbook"
+                    )
+                    response = response.model_copy(update={"tool_calls": [create_call]})
+
             _record_tokens(response, run_log)
             logger.debug(
                 f"[llm] tool_calls={[t['name'] for t in getattr(response, 'tool_calls', [])]}"
@@ -252,12 +303,10 @@ def _extract_final_answer(messages: list) -> str:
     Small models sometimes return empty content after tool results —
     in that case fall back to summarizing the last tool output.
     """
-    # Walk backwards looking for non-empty AIMessage
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content.strip():
             return msg.content.strip()
 
-    # Fallback — extract the last ToolMessage output
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage):
             try:
@@ -271,16 +320,3 @@ def _extract_final_answer(messages: list) -> str:
                     return msg.content.strip()
 
     return "Task completed but no summary was generated."
-
-
-
-
-
-
-
-
-
-
-
-
-
