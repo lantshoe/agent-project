@@ -135,7 +135,7 @@ class BaseAgent:
 
             run_log.finish(
                 final_answer,
-                budget=budget,
+                budget=final_budget,
                 evaluation={"quality":status},
             )
             logger.debug(
@@ -292,8 +292,8 @@ class BaseAgent:
 def _record_tokens(response, run_log):
     usage = getattr(response, "usage_metadata", None)
     run_log.record_llm_call(
-        input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
-        output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+        input_tokens = usage.get("input_tokens", 0) if usage else 0,
+        output_tokens=usage.get("output_tokens", 0) if usage else 0
     )
 
 
