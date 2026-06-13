@@ -96,7 +96,7 @@ class SubagentResult(BaseModel):
         tool_str = ", ".join(self.steps_taken) if self.steps_taken else "no tools"
         return (
             f"{self.task_id} | {self.agent_type} | {self.status}"
-            f"{self.answer[:200]}"
+            f"{self.answer}"
             f"(tools: {tool_str}, {self.duration_s}s)"
         )
 
