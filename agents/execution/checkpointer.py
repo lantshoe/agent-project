@@ -23,9 +23,7 @@ logger = get_logger("checkpointer")
 
 CHECKPOINT_DIR = Path(os.getenv("AGENT_CHECKPOINT_DIR", "./checkpoints"))
 
-
-
-def get_checkpointer():
+async def get_checkpointer():
     """
     return a sqlitesaver checkpointer for persistent state storage
 
@@ -35,25 +33,23 @@ def get_checkpointer():
     return None if langgraph-checkpoint-sqlite is not installed,
     so the agent degrades gracefully to in-memory only.
     """
-
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     db_path = CHECKPOINT_DIR / "agent_state.db"
 
     try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        checkpointer = SqliteSaver.from_conn_string(str(db_path))
-        logger.debug(f"[checkpointer] Persistent checkpointing enabled: {db_path}")
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        checkpointer = AsyncSqliteSaver.from_conn_string(str(db_path))
+        logger.debug(f"[checkpointer] Async checkpointing enabled: {db_path}")
         return checkpointer
 
     except ImportError:
         logger.warning(
-            "[checkpointer] langgraph-checkpoint-sqlite not installed. "
-            "Running without persistence — install with: "
-            "pip install langgraph-checkpoint-sqlite"
+            "[checkpointer] aiosqlite not installed. "
+            "Falling back to MemorySaver. "
+            "Install with: pip install aiosqlite"
         )
         try:
             from langgraph.checkpoint.memory import MemorySaver
-            logger.debug("[checkpointer] Falling back to in-memory checkpointing")
             return MemorySaver()
         except ImportError:
             logger.warning("[checkpointer] No checkpointer available — running stateless")
@@ -65,7 +61,16 @@ def make_run_id(user_id: str) -> str:
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return f"{ts}_{user_id}"
 
+def get_checkpointer_cm(db_path: str):
+    """Returns the AsyncSqliteSaver context manager — use with `async with`."""
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        return AsyncSqliteSaver.from_conn_string(db_path)
+    except ImportError:
+        from langgraph.checkpoint.memory import MemorySaver
+        return MemorySaver()
 
-def make_subagent_thread_id(run_id: str, agent_type: str, task_id: str) -> str:
+def make_subagent_thread_id(run_id: str, agent_type: str, task_id: str, user_id:str) -> str:
     """Generates a thread_id for a subagent run within a supervisor run."""
-    return f"{run_id}_{agent_type}_{task_id}"
+    return  f"{run_id}_{agent_type}_{task_id}" if run_id else f"{user_id}_{agent_type}_{task_id}"
+

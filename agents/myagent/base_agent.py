@@ -6,11 +6,11 @@ Extracted from agent.py,
 
 
 from __future__ import annotations
-
+import os
+os.environ["LANGGRAPH_ALLOWED_MSGPACK_MODULES"] = "agents.core.models"
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated
 import traceback
-
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, END
@@ -24,9 +24,11 @@ from agents.core.run_logger import RunLogger
 from agents.core.skill_enum import Skill
 from agents.core.tool_node import make_tool_node
 from agents.core.verifier import verify_step
+from agents.execution.checkpointer import get_checkpointer, make_subagent_thread_id, get_checkpointer_cm
 from agents.models.supervisor import AgentType, Task, SubagentResult
 
 logger = get_logger("base_agent")
+
 
 # Tools that create or write to files — used to build file_state
 # so downstream tasks know what files/sheets already exist.
@@ -87,7 +89,7 @@ class BaseAgent:
         self.max_steps = max_steps
         self.max_seconds = max_seconds
 
-    async def run(self, task: Task, user_id: str = "default") -> SubagentResult:
+    async def run(self, task: Task, user_id: str = "default",run_id: str = "",checkpointer=None) -> SubagentResult:
         """
         run the ReAct loop for a single task,
         return a typed subagent result to supervisor can use directly.
@@ -108,15 +110,36 @@ class BaseAgent:
             max_steps = self.max_steps,
             max_seconds = self.max_seconds,
         )
-        graph = self._build_graph(run_log)
-
+        thread_id = make_subagent_thread_id(run_id, str(self.agent_type), task.task_id, user_id=user_id)
+        graph = self._build_graph(run_log, checkpointer)
         try:
+            logger.debug(f"[{self.agent_type}:{task.task_id}] checkpoint thread_id: {thread_id}")
             result = await graph.ainvoke({
                 "messages": initial_messages,
                 "completed_steps": [],
                 "budget": [budget],
                 "retry_counts": {},
-            })
+                },
+                config={"configurable": {"thread_id": thread_id}}
+            )
+            # Log checkpoint state after run
+            try:
+                checkpoint = await checkpointer.aget(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                if checkpoint:
+                    logger.debug(
+                        f"[{self.agent_type}:{task.task_id}] checkpoint saved — "
+                        f"id: {checkpoint.get('id', 'unknown')} | "
+                        f"steps: {len(checkpoint.get('channel_values', {}).get('completed_steps', []))}"
+                    )
+                else:
+                    logger.warning(
+                        f"[{self.agent_type}:{task.task_id}] no checkpoint found after run"
+                    )
+            except Exception as e:
+                logger.warning(f"[{self.agent_type}:{task.task_id}] checkpoint read failed: {e}")
+
             final_answer: str = _extract_final_answer(result["messages"])
 
             completed_steps: list[StepRecord] = result.get("completed_steps", [])
@@ -171,7 +194,7 @@ class BaseAgent:
             )
 
 
-    def _build_graph(self, run_log: RunLogger):
+    def _build_graph(self, run_log: RunLogger, checkpointer = None):
         tools = self.tools
         system_prompt = self.system_prompt
         def call_llm(state: AgentState) -> dict:
@@ -287,7 +310,7 @@ class BaseAgent:
         graph.add_edge("tools","budget")
         graph.add_edge("budget","verifier")
         graph.add_edge("verifier","llm")
-        return graph.compile()
+        return graph.compile(checkpointer=checkpointer)
 
 def _record_tokens(response, run_log):
     usage = getattr(response, "usage_metadata", None)

@@ -18,13 +18,9 @@ from datetime import datetime
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from agents.myagent.base_agent import BaseAgent
-from agents.myagent.data_agent import make_data_agent
-from agents.myagent.research_agent import make_research_agent
 from agents.core.llm import get_llm
 from agents.core.logger import get_logger
 from agents.core.skill_enum import Skill
-from agents.execution.checkpointer import make_run_id
 from agents.memory.evaluator import evaluate_execution_quality
 from agents.memory.long_term import LongTermMemory
 from agents.models.supervisor import (
@@ -34,6 +30,13 @@ from agents.models.supervisor import (
     SupervisorState,
     Task,
 )
+import os
+from pathlib import Path
+from agents.execution.checkpointer import get_checkpointer_cm, make_run_id
+from agents.myagent.base_agent import BaseAgent
+from agents.myagent.base_agent import _extract_final_answer
+from agents.myagent.data_agent import make_data_agent
+from agents.myagent.research_agent import make_research_agent
 from agents.tools.calculator import calculator
 from agents.tools.mcp_client import get_mcp_config
 from agents.tools.search import web_search
@@ -159,7 +162,9 @@ async def dispatch_tasks(
         tasks: list[Task],
         mcp_tools: list,
         user_id: str,
+        run_id: str,
         completed_results: list[SubagentResult],
+        checkpointer
 ) -> list[SubagentResult]:
     """
     runs a batch of tasks concurrently with asyncio.gather()
@@ -171,6 +176,45 @@ async def dispatch_tasks(
     """
 
     async def run_one(task: Task) -> SubagentResult:
+        thread_id = f"{run_id}_{task.agent_type}_{task.task_id}"
+
+        # Check if this task already completed in a previous run
+        try:
+            existing = await checkpointer.aget(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            if existing:
+                channel_values = existing.get("channel_values", {})
+                messages = channel_values.get("messages", [])
+                completed_steps = channel_values.get("completed_steps", [])
+                final_answer = _extract_final_answer(messages) if messages else ""
+                has_real_answer = bool(final_answer and final_answer != "Task completed but no summary was generated.")
+                has_steps = len(completed_steps) > 0
+
+                if has_real_answer or has_steps:
+                    logger.info(
+                        f"[supervisor] ↩ SKIPPING task '{task.task_id}' "
+                        f"({task.agent_type}) — completed in previous run | "
+                        f"steps: {len(completed_steps)}"
+                    )
+                    return SubagentResult(
+                        task_id=task.task_id,
+                        agent_type=task.agent_type,
+                        status="success",
+                        answer=final_answer,
+                        steps_taken=[s.tool for s in completed_steps],
+                    )
+                else:
+                    logger.debug(
+                        f"[supervisor] checkpoint exists for '{task.task_id}' "
+                        f"but task didn't complete — resuming from checkpoint"
+                    )
+        except Exception as e:
+            logger.debug(
+                f"[supervisor] checkpoint check failed for '{task.task_id}': {e} — running fresh"
+            )
+
+        # No checkpoint found — inject dependency context and run normally
         for dep_id in task.depends_on:
             dep_result = next(
                 (r for r in completed_results if r.task_id == dep_id), None
@@ -183,7 +227,7 @@ async def dispatch_tasks(
                 task = task.with_context(dep_id, context_payload)
 
         agent = make_agent_for_task(task, mcp_tools)
-        return await agent.run(task=task, user_id=user_id)
+        return await agent.run(task=task, user_id=user_id, run_id=run_id, checkpointer=checkpointer)
 
     logger.debug(f"[supervisor] Dispatching {len(tasks)} tasks in parallel: "
                  f"{[t.task_id for t in tasks]}")
@@ -267,114 +311,138 @@ def aggregate_results(user_input: str, state: SupervisorState) -> str:
 
 async def run_multiagent(
         user_input: str,
+        job_id: str,
         user_id: str = "default",
         max_seconds: int = 600,
 ) -> str:
-    run_id = make_run_id(user_id=user_id)
+    run_id = job_id if job_id else make_run_id(user_id=user_id)
     start_time = datetime.now()
+    db_path = str(Path(os.getenv("AGENT_CHECKPOINT_DIR", "./checkpoints")) / "agent_state.db")
 
     logger.debug(f"[supervisor] Run started: {run_id}")
     logger.debug(f"[supervisor] Input: {user_input[:1000]}")
 
-    client = MultiServerMCPClient(get_mcp_config())
-    mcp_tools = await client.get_tools()
-    memory = LongTermMemory(user_id=user_id)
-    memory_context = memory.format_for_llm(user_input)
-
-    plan = decompose_task(user_input, memory_context)
-    state = SupervisorState(run_id=run_id, user_input=user_input, plan=plan)
-
-    remaining = list(plan.tasks)
-    max_round = 10
-    rounds = 0
-
-    while remaining and rounds < max_round:
-        rounds += 1
-        ready = [
-            t for t in remaining
-            if all(dep in state.completed_task_ids for dep in t.depends_on)
-        ]
-
-        if not ready:
-            logger.error(
-                "[supervisor] No tasks ready to run — "
-                "possible circular dependency. Stopping."
+    async with get_checkpointer_cm(db_path) as checkpointer:
+        # Check resume vs new run
+        try:
+            sample_thread = f"{run_id}_AgentType.RESEARCH_task_1"
+            existing = await checkpointer.aget(
+                {"configurable": {"thread_id": sample_thread}}
             )
-            break
+            if existing:
+                logger.info(f"[supervisor] ▶ RESUMING job: {run_id}")
+            else:
+                logger.info(f"[supervisor] ▶ NEW run: {run_id}")
+        except Exception:
+            logger.info(f"[supervisor] ▶ NEW run: {run_id}")
 
-        batch_results = await dispatch_tasks(
-            tasks=ready,
-            mcp_tools=mcp_tools,
-            user_id=user_id,
-            completed_results=list(state.results),
+
+        start_time = datetime.now()
+
+        logger.debug(f"[supervisor] Run started: {run_id}")
+        logger.debug(f"[supervisor] Input: {user_input[:1000]}")
+
+        client = MultiServerMCPClient(get_mcp_config())
+        mcp_tools = await client.get_tools()
+        memory = LongTermMemory(user_id=user_id)
+        memory_context = memory.format_for_llm(user_input)
+
+        plan = decompose_task(user_input, memory_context)
+        state = SupervisorState(run_id=run_id, user_input=user_input, plan=plan)
+
+        remaining = list(plan.tasks)
+        max_round = 10
+        rounds = 0
+
+        while remaining and rounds < max_round:
+            rounds += 1
+            ready = [
+                t for t in remaining
+                if all(dep in state.completed_task_ids for dep in t.depends_on)
+            ]
+
+            if not ready:
+                logger.error(
+                    "[supervisor] No tasks ready to run — "
+                    "possible circular dependency. Stopping."
+                )
+                break
+
+            batch_results = await dispatch_tasks(
+                tasks=ready,
+                mcp_tools=mcp_tools,
+                user_id=user_id,
+                run_id=run_id,
+                completed_results=list(state.results),
+                checkpointer=checkpointer,
+            )
+
+            usable, failed = handle_failures(batch_results, plan)
+            for r in batch_results:
+                state.add_result(r)
+
+            completed_ids = {r.task_id for r in batch_results}
+            remaining = [t for t in remaining if t.task_id not in completed_ids]
+            logger.debug(
+                f"[supervisor] Round {rounds}: "
+                f"{len(usable)} succeeded, {len(failed)} failed, "
+                f"{len(remaining)} remaining"
+            )
+            critical_failed = [
+                r for r in failed
+                if plan.get_task(r.task_id) and
+                   plan.get_task(r.task_id).priority >= 3
+            ]
+            if critical_failed and not usable:
+                logger.error("[supervisor] Critical tasks failed — stopping early")
+                break
+
+        final_answer = aggregate_results(user_input, state)
+        duration_s = (datetime.now() - start_time).total_seconds()
+
+        logger.info(
+            f"[supervisor] Run complete — {run_id} | "
+            f"tasks={len(plan.tasks)} | "
+            f"success_rate={state.success_rate:.0%} | "
+            f"time={duration_s:.1f}s"
         )
 
-        usable, failed = handle_failures(batch_results, plan)
-        for r in batch_results:
-            state.add_result(r)
-
-        completed_ids = {r.task_id for r in batch_results}
-        remaining = [t for t in remaining if t.task_id not in completed_ids]
-        logger.debug(
-            f"[supervisor] Round {rounds}: "
-            f"{len(usable)} succeeded, {len(failed)} failed, "
-            f"{len(remaining)} remaining"
-        )
-        critical_failed = [
-            r for r in failed
-            if plan.get_task(r.task_id) and
-               plan.get_task(r.task_id).priority >= 3
+        # Memory
+        steps_as_dicts = [
+            {"tool": step, "status": "success"}
+            for r in state.successful_results
+            for step in r.steps_taken
         ]
-        if critical_failed and not usable:
-            logger.error("[supervisor] Critical tasks failed — stopping early")
-            break
+        plans = [
+            {
+                "step": i + 1,
+                "tool": t.agent_type,
+                "reason": t.instruction[:100],
+            }
+            for i, t in enumerate(plan.tasks)
+        ]
+        evaluation = evaluate_execution_quality(
+            user_input=user_input,
+            plan=plans,
+            completed_steps=steps_as_dicts,
+            final_answer=final_answer,
+        )
+        memory.store_episode(
+            user_input=user_input,
+            completed_steps=steps_as_dicts,
+            final_answer=final_answer,
+            evaluation=evaluation,
+        )
+        memory.update_profile({
+            "last_task": user_input[:100],
+            "agents_used": list({r.agent_type for r in state.results}),
+            "task_quality": evaluation.get("quality"),
+            "session_date": datetime.now().isoformat(),
+        })
 
-    final_answer = aggregate_results(user_input, state)
-    duration_s = (datetime.now() - start_time).total_seconds()
+        return final_answer
 
-    logger.info(
-        f"[supervisor] Run complete — {run_id} | "
-        f"tasks={len(plan.tasks)} | "
-        f"success_rate={state.success_rate:.0%} | "
-        f"time={duration_s:.1f}s"
-    )
-
-    # Memory
-    steps_as_dicts = [
-        {"tool": step, "status": "success"}
-        for r in state.successful_results
-        for step in r.steps_taken
-    ]
-    plans = [
-        {
-            "step": i + 1,
-            "tool": t.agent_type,
-            "reason": t.instruction[:100],
-        }
-        for i, t in enumerate(plan.tasks)
-    ]
-    evaluation = evaluate_execution_quality(
-        user_input=user_input,
-        plan=plans,
-        completed_steps=steps_as_dicts,
-        final_answer=final_answer,
-    )
-    memory.store_episode(
-        user_input=user_input,
-        completed_steps=steps_as_dicts,
-        final_answer=final_answer,
-        evaluation=evaluation,
-    )
-    memory.update_profile({
-        "last_task": user_input[:100],
-        "agents_used": list({r.agent_type for r in state.results}),
-        "task_quality": evaluation.get("quality"),
-        "session_date": datetime.now().isoformat(),
-    })
-
-    return final_answer
-
-def run_multiagent_sync(user_input: str, user_id: str = "default") -> str:
+def run_multiagent_sync(user_input: str,  job_id: str, user_id: str = "default",) -> str:
     """Sync wrapper for convenience."""
     try:
         loop = asyncio.get_running_loop()
@@ -384,10 +452,10 @@ def run_multiagent_sync(user_input: str, user_id: str = "default") -> str:
     if loop and loop.is_running():
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, run_multiagent(user_input, user_id))
+            future = pool.submit(asyncio.run, run_multiagent(user_input, job_id, user_id))
             return future.result()
 
-    return asyncio.run(run_multiagent(user_input, user_id))
+    return asyncio.run(run_multiagent(user_input, job_id, user_id))
 
 
 if __name__ == "__main__":
@@ -395,5 +463,5 @@ if __name__ == "__main__":
     Research the top 3 AI companies by revenue in 2025,
     then create an Excel file called ai_companies.xlsx
     and write the research results to it.
-    """)
+    """, "5")
     print(response)
